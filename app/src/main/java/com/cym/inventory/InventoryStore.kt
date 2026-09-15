@@ -1,10 +1,13 @@
 package com.cym.inventory
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.Base64
 import androidx.core.content.FileProvider
 import org.json.JSONArray
-import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.math.BigDecimal
 import java.time.LocalDate
@@ -20,12 +23,13 @@ internal data class InventoryItem(
     val status: ItemStatus = ItemStatus.PLANNED,
     val priceCents: Long? = null,
     val purchaseDate: String? = null,
-    val receiptFile: String? = null,
-    val photoFile: String? = null,
+    val receiptMime: String? = null,
+    val photoMime: String? = null,
     val shop: String = "",
     val description: String = "",
     val location: String = "",
     val purpose: String = "",
+    val updatedAt: Long = System.currentTimeMillis(),
 )
 
 internal data class WishlistItem(
@@ -37,30 +41,36 @@ internal data class WishlistItem(
     val priceCents: Long? = null,
     val notes: String = "",
     val addedBy: String = "",
-    val photoFile: String? = null,
+    val photoMime: String? = null,
     val addedDate: String = LocalDate.now().toString(),
+    val updatedAt: Long = System.currentTimeMillis(),
 )
 
-/** Local data for the first Android milestone. Cloud synchronization will replace this store. */
+/** Local file cache for photos/receipts (keyed by item id) plus the legacy on-device JSON, kept only to migrate old data into a household. */
 internal class InventoryStore(private val context: Context) {
-    private val dataFile = File(context.filesDir, "inventory-v1.json")
-    private val wishlistFile = File(context.filesDir, "wishlist-v1.json")
+    private val legacyDataFile = File(context.filesDir, "inventory-v1.json")
+    private val legacyWishlistFile = File(context.filesDir, "wishlist-v1.json")
 
-    fun load(): List<InventoryItem> = runCatching {
-        if (!dataFile.exists()) return emptyList()
-        val data = JSONArray(dataFile.readText())
+    // ---------- Legacy local JSON (pre-Firestore), used once to migrate into a household ----------
+
+    fun loadLegacyItems(): List<InventoryItem> = runCatching {
+        if (!legacyDataFile.exists()) return emptyList()
+        val data = JSONArray(legacyDataFile.readText())
         (0 until data.length()).map { index ->
             val value = data.getJSONObject(index)
+            val id = value.getString("id")
+            val oldReceipt = value.optString("receiptFile").takeIf(String::isNotBlank)
+            val oldPhoto = value.optString("photoFile").takeIf(String::isNotBlank)
             InventoryItem(
-                id = value.getString("id"),
+                id = id,
                 name = value.getString("name"),
                 room = value.optString("room"),
                 category = value.optString("category"),
                 status = ItemStatus.valueOf(value.optString("status", "PLANNED")),
                 priceCents = if (value.isNull("priceCents")) null else value.getLong("priceCents"),
                 purchaseDate = value.optString("purchaseDate").takeIf(String::isNotBlank),
-                receiptFile = value.optString("receiptFile").takeIf(String::isNotBlank),
-                photoFile = value.optString("photoFile").takeIf(String::isNotBlank),
+                receiptMime = oldReceipt?.let { migrateLegacyFile(it, "receipts", id) },
+                photoMime = oldPhoto?.let { migrateLegacyFile(it, "photos", id) },
                 shop = value.optString("shop"),
                 description = value.optString("description"),
                 location = value.optString("location"),
@@ -69,35 +79,15 @@ internal class InventoryStore(private val context: Context) {
         }
     }.getOrElse { emptyList() }
 
-    fun save(items: List<InventoryItem>) {
-        val data = JSONArray()
-        items.forEach { item ->
-            data.put(JSONObject().apply {
-                put("id", item.id)
-                put("name", item.name)
-                put("room", item.room)
-                put("category", item.category)
-                put("status", item.status.name)
-                put("priceCents", item.priceCents)
-                put("purchaseDate", item.purchaseDate)
-                put("receiptFile", item.receiptFile)
-                put("photoFile", item.photoFile)
-                put("shop", item.shop)
-                put("description", item.description)
-                put("location", item.location)
-                put("purpose", item.purpose)
-            })
-        }
-        writeAtomically(dataFile, data.toString())
-    }
-
-    fun loadWishlist(): List<WishlistItem> = runCatching {
-        if (!wishlistFile.exists()) return emptyList()
-        val data = JSONArray(wishlistFile.readText())
+    fun loadLegacyWishlist(): List<WishlistItem> = runCatching {
+        if (!legacyWishlistFile.exists()) return emptyList()
+        val data = JSONArray(legacyWishlistFile.readText())
         (0 until data.length()).map { index ->
             val value = data.getJSONObject(index)
+            val id = value.getString("id")
+            val oldPhoto = value.optString("photoFile").takeIf(String::isNotBlank)
             WishlistItem(
-                id = value.getString("id"),
+                id = id,
                 name = value.getString("name"),
                 url = value.optString("url"),
                 shop = value.optString("shop"),
@@ -105,75 +95,94 @@ internal class InventoryStore(private val context: Context) {
                 priceCents = if (value.isNull("priceCents")) null else value.getLong("priceCents"),
                 notes = value.optString("notes"),
                 addedBy = value.optString("addedBy"),
-                photoFile = value.optString("photoFile").takeIf(String::isNotBlank),
+                photoMime = oldPhoto?.let { migrateLegacyFile(it, "wishlist-photos", id) },
                 addedDate = value.optString("addedDate").takeIf(String::isNotBlank) ?: LocalDate.now().toString(),
             )
         }
     }.getOrElse { emptyList() }
 
-    fun saveWishlist(items: List<WishlistItem>) {
-        val data = JSONArray()
-        items.forEach { item ->
-            data.put(JSONObject().apply {
-                put("id", item.id)
-                put("name", item.name)
-                put("url", item.url)
-                put("shop", item.shop)
-                put("location", item.location)
-                put("priceCents", item.priceCents)
-                put("notes", item.notes)
-                put("addedBy", item.addedBy)
-                put("photoFile", item.photoFile)
-                put("addedDate", item.addedDate)
-            })
-        }
-        writeAtomically(wishlistFile, data.toString())
+    private fun migrateLegacyFile(oldFileName: String, subdir: String, newId: String): String? {
+        val oldFile = File(context.filesDir, "$subdir/$oldFileName")
+        if (!oldFile.exists()) return null
+        val mime = mimeTypeFor(oldFileName)
+        val newFile = File(context.filesDir, "$subdir/$newId.${extensionFor(mime)}")
+        return runCatching { oldFile.copyTo(newFile, overwrite = true); mime }.getOrNull()
     }
 
-    private fun writeAtomically(target: File, content: String) {
-        val pending = File(target.parentFile, "${target.name}.tmp")
-        pending.writeText(content)
-        check(pending.renameTo(target)) { "Could not save ${target.name}" }
+    // ---------- Local media cache (deterministic path: {subdir}/{id}.{ext}) ----------
+
+    private fun extensionFor(mime: String?): String = when (mime) {
+        "application/pdf" -> "pdf"
+        "image/png" -> "png"
+        "image/webp" -> "webp"
+        else -> "jpg"
     }
 
-    private fun copyFile(uri: Uri, subdir: String): String {
-        val directory = File(context.filesDir, subdir).apply { mkdirs() }
-        val type = context.contentResolver.getType(uri)
-        val extension = when (type) {
-            "application/pdf" -> "pdf"
-            "image/png" -> "png"
-            "image/webp" -> "webp"
-            else -> "jpg"
-        }
-        val file = File(directory, "${UUID.randomUUID()}.$extension")
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            file.outputStream().use(input::copyTo)
-        } ?: error("Archivo no disponible")
-        return file.name
-    }
-
-    fun copyReceipt(uri: Uri): String = copyFile(uri, "receipts")
-    fun copyPhoto(uri: Uri): String = copyFile(uri, "photos")
-    fun copyWishlistPhoto(uri: Uri): String = copyFile(uri, "wishlist-photos")
-
-    private fun fileUri(subdir: String, fileName: String?): Uri? = fileName?.let { name ->
-        if (name != File(name).name) return@let null
-        File(context.filesDir, "$subdir/$name").takeIf(File::exists)?.let {
-            FileProvider.getUriForFile(context, context.packageName + ".fileprovider", it)
-        }
-    }
-
-    fun receiptUri(item: InventoryItem): Uri? = fileUri("receipts", item.receiptFile)
-    fun photoUri(item: InventoryItem): Uri? = fileUri("photos", item.photoFile)
-    fun wishlistPhotoUri(item: WishlistItem): Uri? = fileUri("wishlist-photos", item.photoFile)
-
-    fun receiptMimeType(item: InventoryItem): String = mimeTypeFor(item.receiptFile)
-
-    private fun mimeTypeFor(fileName: String?): String = when (fileName?.substringAfterLast('.')) {
+    private fun mimeTypeFor(fileName: String): String = when (fileName.substringAfterLast('.').lowercase()) {
         "pdf" -> "application/pdf"
         "png" -> "image/png"
         "webp" -> "image/webp"
         else -> "image/jpeg"
+    }
+
+    private fun mediaFile(subdir: String, id: String, mime: String): File = File(context.filesDir, "$subdir/$id.${extensionFor(mime)}")
+
+    private fun toFileProviderUri(file: File): Uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+
+    fun photoUri(item: InventoryItem): Uri? = item.photoMime?.let { mediaFile("photos", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
+    fun receiptUri(item: InventoryItem): Uri? = item.receiptMime?.let { mediaFile("receipts", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
+    fun wishlistPhotoUri(item: WishlistItem): Uri? = item.photoMime?.let { mediaFile("wishlist-photos", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
+    fun receiptMimeType(item: InventoryItem): String = item.receiptMime ?: "image/jpeg"
+
+    /** Copies a picked content Uri into the local cache at a deterministic path and returns its MIME type. */
+    fun cachePickedFile(uri: Uri, subdir: String, id: String): String {
+        val type = context.contentResolver.getType(uri) ?: "image/jpeg"
+        val directory = File(context.filesDir, subdir).apply { mkdirs() }
+        val file = File(directory, "$id.${extensionFor(type)}")
+        context.contentResolver.openInputStream(uri)?.use { input -> file.outputStream().use(input::copyTo) }
+            ?: error("Archivo no disponible")
+        return type
+    }
+
+    fun deleteLocalMedia(subdir: String, id: String) {
+        File(context.filesDir, subdir).listFiles { f -> f.nameWithoutExtension == id }?.forEach { it.delete() }
+    }
+
+    /** Decodes a base64 payload from Firestore into the local cache, if not already cached on this device. */
+    fun materializeFromBase64(subdir: String, id: String, mime: String, base64: String) {
+        val file = mediaFile(subdir, id, mime)
+        if (file.exists()) return
+        runCatching {
+            file.parentFile?.mkdirs()
+            file.writeBytes(Base64.decode(base64, Base64.NO_WRAP))
+        }
+    }
+
+    /** Compresses (images) or reads (PDFs) the cached file for upload; null if it can't fit the free Firestore document budget. */
+    fun prepareUpload(subdir: String, id: String, mime: String, maxBytes: Int = 650_000): String? {
+        val file = mediaFile(subdir, id, mime)
+        if (!file.exists()) return null
+        val bytes = if (mime == "application/pdf") file.readBytes().takeIf { it.size <= maxBytes }
+            else compressImage(file, maxBytes)
+        return bytes?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+    }
+
+    private fun compressImage(file: File, maxBytes: Int): ByteArray? {
+        var sample = 1
+        repeat(4) {
+            val options = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bitmap = BitmapFactory.decodeFile(file.path, options) ?: return null
+            var quality = 85
+            while (quality >= 30) {
+                val out = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+                val bytes = out.toByteArray()
+                if (bytes.size <= maxBytes) return bytes
+                quality -= 20
+            }
+            sample *= 2
+        }
+        return null
     }
 
     /** Exports the full inventory as a semicolon-separated CSV that Excel opens directly. */
@@ -196,8 +205,8 @@ internal class InventoryStore(private val context: Context) {
                 item.location,
                 item.purpose,
                 item.description,
-                if (item.receiptFile != null) "Sí" else "No",
-                if (item.photoFile != null) "Sí" else "No",
+                if (item.receiptMime != null) "Sí" else "No",
+                if (item.photoMime != null) "Sí" else "No",
             )
         }
         val csv = buildString {

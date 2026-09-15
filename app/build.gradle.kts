@@ -1,6 +1,8 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.gms.google-services")
+    id("com.google.firebase.appdistribution")
 }
 
 android {
@@ -20,6 +22,15 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    buildTypes {
+        debug {
+            configure<com.google.firebase.appdistribution.gradle.AppDistributionExtension> {
+                releaseNotes = "Nueva versión de prueba de CyMInventory."
+                testers = "cristianpatosanchez88@gmail.com, meugeniaalhambralara@gmail.com"
+            }
+        }
+    }
 }
 
 
@@ -32,5 +43,11 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    val firebaseBom = platform("com.google.firebase:firebase-bom:34.19.0")
+    implementation(firebaseBom)
+    implementation("com.google.firebase:firebase-auth")
+    implementation("com.google.firebase:firebase-firestore")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.10.2")
 }
 

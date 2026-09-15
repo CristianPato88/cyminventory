@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
@@ -51,6 +52,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -148,12 +150,140 @@ private enum class Tab(val title: String, val icon: Int) {
 }
 
 @Composable
-internal fun InventoryApp(store: InventoryStore) {
-    val items = remember { mutableStateListOf<InventoryItem>().apply { addAll(store.load()) } }
-    val wishlist = remember { mutableStateListOf<WishlistItem>().apply { addAll(store.loadWishlist()) } }
-    val context = LocalContext.current
+internal fun AppRoot(store: InventoryStore, repo: HouseholdRepository) {
+    var householdId by remember { mutableStateOf(repo.householdId) }
     val darkTheme = isSystemInDarkTheme()
     val colors = if (darkTheme) DarkPalette else LightPalette
+    val scheme = if (darkTheme) {
+        darkColorScheme(primary = colors.pine, onPrimary = colors.onPine, surface = colors.paper,
+            onSurface = colors.ink, background = colors.cream, onBackground = colors.ink)
+    } else {
+        lightColorScheme(primary = colors.pine, onPrimary = colors.onPine, surface = colors.paper,
+            onSurface = colors.ink, background = colors.cream, onBackground = colors.ink)
+    }
+    CompositionLocalProvider(LocalPalette provides colors) {
+        MaterialTheme(colorScheme = scheme) {
+            val id = householdId
+            if (id == null) {
+                HouseholdOnboardingScreen(repo, onReady = { householdId = it })
+            } else {
+                InventoryApp(store, repo, id)
+            }
+        }
+    }
+}
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun HouseholdOnboardingScreen(repo: HouseholdRepository, onReady: (String) -> Unit) {
+    val colors = LocalPalette.current
+    var mode by remember { mutableStateOf(0) } // 0 elegir, 1 crear, 2 unirse
+    var name by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    var loading by remember { mutableStateOf(false) }
+    var createdCode by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    Column(Modifier.fillMaxSize().background(colors.cream).windowInsetsPadding(WindowInsets.safeDrawing)
+        .verticalScroll(rememberScrollState()).padding(24.dp)) {
+        Spacer(Modifier.height(40.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Image(painter = painterResource(R.drawable.cym_icon), contentDescription = null,
+                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(13.dp)))
+            Text("Gestión de inventario de nuestro hogar.", color = colors.ink, fontFamily = Syne,
+                fontWeight = FontWeight.Bold, fontSize = 16.sp, lineHeight = 19.sp)
+        }
+        Spacer(Modifier.height(48.dp))
+        val code0 = createdCode
+        if (code0 != null) {
+            Text("Vuestro hogar está listo.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 28.sp)
+            Spacer(Modifier.height(10.dp))
+            Text("Compartid este código con la otra persona para que se una desde su móvil.",
+                color = colors.muted, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 19.sp)
+            Spacer(Modifier.height(22.dp))
+            Surface(color = colors.paper, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+                Text(code0, color = colors.pine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 30.sp,
+                    letterSpacing = 3.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(24.dp))
+            }
+            Spacer(Modifier.height(20.dp))
+            Button(onClick = { onReady(code0) }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine),
+                modifier = Modifier.fillMaxWidth()) { Text("Entrar", fontFamily = Manrope, fontWeight = FontWeight.Bold) }
+        } else when (mode) {
+            0 -> {
+                Text("Bienvenidos.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 34.sp)
+                Spacer(Modifier.height(10.dp))
+                Text("Cread un hogar nuevo o uníos a uno que ya exista con el código que os hayan pasado.",
+                    color = colors.muted, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 19.sp)
+                Spacer(Modifier.height(26.dp))
+                Button(onClick = { mode = 1 }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine),
+                    modifier = Modifier.fillMaxWidth()) { Text("Crear nuestro hogar", fontFamily = Manrope, fontWeight = FontWeight.Bold) }
+                Spacer(Modifier.height(12.dp))
+                TextButton(onClick = { mode = 2 }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Unirme con un código", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                }
+            }
+            else -> {
+                Text(if (mode == 1) "Vuestro hogar" else "Unirse a un hogar", color = colors.ink, fontFamily = Syne,
+                    fontWeight = FontWeight.Bold, fontSize = 30.sp)
+                Spacer(Modifier.height(10.dp))
+                Text(if (mode == 1) "Le pondremos un código único para compartir con la otra persona."
+                    else "Introduce el código de 8 caracteres que os han compartido.",
+                    color = colors.muted, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 19.sp)
+                Spacer(Modifier.height(22.dp))
+                OutlinedTextField(name, onValueChange = { name = it }, label = { Text("Tu nombre") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (mode == 2) {
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(code, onValueChange = { code = it.uppercase() }, label = { Text("Código del hogar") },
+                        singleLine = true, modifier = Modifier.fillMaxWidth())
+                }
+                if (error.isNotBlank()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(error, color = colors.danger, fontFamily = Manrope, fontSize = 12.sp)
+                }
+                Spacer(Modifier.height(18.dp))
+                Button(enabled = !loading, onClick = {
+                    if (name.isBlank()) { error = "Dinos cómo te llamas"; return@Button }
+                    if (mode == 2 && code.isBlank()) { error = "Escribe el código del hogar"; return@Button }
+                    error = ""
+                    loading = true
+                    scope.launch {
+                        try {
+                            if (mode == 1) {
+                                createdCode = repo.createHousehold(name.trim())
+                            } else {
+                                if (repo.joinHousehold(code.trim(), name.trim())) onReady(repo.householdId!!)
+                                else error = "No encontramos ese código. Revísalo con la otra persona."
+                            }
+                        } catch (e: Exception) {
+                            error = "No se pudo conectar. Comprueba tu conexión a internet."
+                        }
+                        loading = false
+                    }
+                }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine), modifier = Modifier.fillMaxWidth()) {
+                    Text(if (loading) "Un momento…" else if (mode == 1) "Crear hogar" else "Unirme",
+                        fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.height(10.dp))
+                TextButton(onClick = { mode = 0; error = "" }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Volver", color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, householdId: String) {
+    val colors = LocalPalette.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val itemsFlow = remember(householdId) { repo.itemsFlow(householdId) }
+    val wishlistFlow = remember(householdId) { repo.wishlistFlow(householdId) }
+    val items by itemsFlow.collectAsState(initial = emptyList())
+    val wishlist by wishlistFlow.collectAsState(initial = emptyList())
     var receiptError by remember { mutableStateOf("") }
     var tab by remember { mutableStateOf(Tab.PLANNED) }
     var sheetItem by remember { mutableStateOf<InventoryItem?>(null) }
@@ -167,38 +297,46 @@ internal fun InventoryApp(store: InventoryStore) {
         sheetPurchase = purchase
         sheetOpen = true
     }
-    fun saveItem(item: InventoryItem) {
-        val index = items.indexOfFirst { it.id == item.id }
-        if (index >= 0) items[index] = item else items.add(0, item)
-        store.save(items.toList())
+    fun saveItem(item: InventoryItem, pickedPhoto: Uri?, pickedReceipt: Uri?) {
         sheetOpen = false
+        scope.launch {
+            runCatching { repo.saveItem(householdId, item, pickedPhoto, pickedReceipt) }
+                .onFailure { receiptError = "No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo." }
+        }
+    }
+    fun deleteItem(item: InventoryItem) {
+        sheetOpen = false
+        scope.launch { runCatching { repo.deleteItem(householdId, item) } }
     }
 
     fun openWishlistSheet(item: WishlistItem?) {
         wishlistSheetItem = item
         wishlistSheetOpen = true
     }
-    fun saveWishlistItem(item: WishlistItem) {
-        val index = wishlist.indexOfFirst { it.id == item.id }
-        if (index >= 0) wishlist[index] = item else wishlist.add(0, item)
-        store.saveWishlist(wishlist.toList())
+    fun saveWishlistItem(item: WishlistItem, pickedPhoto: Uri?) {
         wishlistSheetOpen = false
+        scope.launch {
+            runCatching { repo.saveWishlistItem(householdId, item, pickedPhoto) }
+                .onFailure { receiptError = "No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo." }
+        }
     }
     fun deleteWishlistItem(item: WishlistItem) {
-        wishlist.removeAll { it.id == item.id }
-        store.saveWishlist(wishlist.toList())
+        scope.launch { runCatching { repo.deleteWishlistItem(householdId, item) } }
     }
     fun moveWishlistToPending(item: WishlistItem) {
-        items.add(0, InventoryItem(name = item.name, shop = item.shop, location = item.location,
-            description = item.notes, priceCents = item.priceCents))
-        store.save(items.toList())
-        deleteWishlistItem(item)
+        scope.launch {
+            runCatching {
+                repo.saveItem(householdId, InventoryItem(name = item.name, shop = item.shop, location = item.location,
+                    description = item.notes, priceCents = item.priceCents), null, null)
+                repo.deleteWishlistItem(householdId, item)
+            }
+        }
     }
 
     fun openReceipt(item: InventoryItem) {
         val uri = store.receiptUri(item)
         if (uri == null) {
-            receiptError = "No se encuentra el ticket en este móvil."
+            receiptError = "El ticket aún no se ha sincronizado en este móvil. Prueba de nuevo en un momento."
             return
         }
         try {
@@ -213,7 +351,7 @@ internal fun InventoryApp(store: InventoryStore) {
 
     fun exportInventory() {
         try {
-            val uri = store.exportCsv(items.toList())
+            val uri = store.exportCsv(items)
             val send = Intent(Intent.ACTION_SEND).apply {
                 type = "text/csv"
                 putExtra(Intent.EXTRA_STREAM, uri)
@@ -225,61 +363,51 @@ internal fun InventoryApp(store: InventoryStore) {
         }
     }
 
-    val scheme = if (darkTheme) {
-        darkColorScheme(primary = colors.pine, onPrimary = colors.onPine, surface = colors.paper,
-            onSurface = colors.ink, background = colors.cream, onBackground = colors.ink)
-    } else {
-        lightColorScheme(primary = colors.pine, onPrimary = colors.onPine, surface = colors.paper,
-            onSurface = colors.ink, background = colors.cream, onBackground = colors.ink)
-    }
-    CompositionLocalProvider(LocalPalette provides colors) {
-    MaterialTheme(colorScheme = scheme) {
-        Column(Modifier.fillMaxSize().background(colors.cream).windowInsetsPadding(WindowInsets.safeDrawing)) {
-            Box(Modifier.weight(1f)) {
-                when (tab) {
-                    Tab.PLANNED -> PlannedScreen(items.filter { it.status == ItemStatus.PLANNED }, store,
-                        recentHome = items.filter { it.status == ItemStatus.PURCHASED }.take(3),
-                        onAdd = { openSheet(null, false) }, onBuy = { openSheet(it, true) },
-                        onEdit = { openSheet(it, false) }, onOpenHome = { openSheet(it, true) },
-                        onSeeAllHome = { tab = Tab.HOME })
-                    Tab.HOME -> HomeScreen(items.filter { it.status == ItemStatus.PURCHASED }, store,
-                        onAddPurchase = { openSheet(null, true) }, onEdit = { openSheet(it, true) },
-                        onReceipt = ::openReceipt, onExport = ::exportInventory)
-                    Tab.WISHLIST -> WishlistScreen(wishlist, store,
-                        onAdd = { openWishlistSheet(null) }, onEdit = { openWishlistSheet(it) },
-                        onDelete = ::deleteWishlistItem, onMoveToPending = ::moveWishlistToPending)
-                    Tab.SHARED -> SharedScreen()
-                    Tab.EXPENSES -> ExpenseScreen(items.filter { it.status == ItemStatus.PURCHASED })
-                }
+    Column(Modifier.fillMaxSize().background(colors.cream).windowInsetsPadding(WindowInsets.safeDrawing)) {
+        Box(Modifier.weight(1f)) {
+            when (tab) {
+                Tab.PLANNED -> PlannedScreen(items.filter { it.status == ItemStatus.PLANNED }, store,
+                    recentHome = items.filter { it.status == ItemStatus.PURCHASED }.take(3),
+                    onAdd = { openSheet(null, false) }, onBuy = { openSheet(it, true) },
+                    onEdit = { openSheet(it, false) }, onOpenHome = { openSheet(it, true) },
+                    onSeeAllHome = { tab = Tab.HOME })
+                Tab.HOME -> HomeScreen(items.filter { it.status == ItemStatus.PURCHASED }, store,
+                    onAddPurchase = { openSheet(null, true) }, onEdit = { openSheet(it, true) },
+                    onReceipt = ::openReceipt, onExport = ::exportInventory)
+                Tab.WISHLIST -> WishlistScreen(wishlist, store,
+                    onAdd = { openWishlistSheet(null) }, onEdit = { openWishlistSheet(it) },
+                    onDelete = ::deleteWishlistItem, onMoveToPending = ::moveWishlistToPending)
+                Tab.SHARED -> SharedScreen(repo, householdId)
+                Tab.EXPENSES -> ExpenseScreen(items.filter { it.status == ItemStatus.PURCHASED })
             }
-            BottomBar(tab, onTab = { tab = it })
         }
-        if (receiptError.isNotBlank()) {
-            androidx.compose.material3.AlertDialog(
-                onDismissRequest = { receiptError = "" },
-                title = { Text("Ticket") },
-                text = { Text(receiptError) },
-                confirmButton = { TextButton(onClick = { receiptError = "" }) { Text("Cerrar") } },
-            )
-        }
-        if (sheetOpen) {
-            ItemSheet(
-                item = sheetItem,
-                purchase = sheetPurchase,
-                store = store,
-                onDismiss = { sheetOpen = false },
-                onSave = ::saveItem,
-            )
-        }
-        if (wishlistSheetOpen) {
-            WishlistSheet(
-                item = wishlistSheetItem,
-                store = store,
-                onDismiss = { wishlistSheetOpen = false },
-                onSave = ::saveWishlistItem,
-            )
-        }
+        BottomBar(tab, onTab = { tab = it })
     }
+    if (receiptError.isNotBlank()) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { receiptError = "" },
+            title = { Text("Aviso") },
+            text = { Text(receiptError) },
+            confirmButton = { TextButton(onClick = { receiptError = "" }) { Text("Cerrar") } },
+        )
+    }
+    if (sheetOpen) {
+        ItemSheet(
+            item = sheetItem,
+            purchase = sheetPurchase,
+            store = store,
+            onDismiss = { sheetOpen = false },
+            onSave = ::saveItem,
+            onDelete = ::deleteItem,
+        )
+    }
+    if (wishlistSheetOpen) {
+        WishlistSheet(
+            item = wishlistSheetItem,
+            store = store,
+            onDismiss = { wishlistSheetOpen = false },
+            onSave = ::saveWishlistItem,
+        )
     }
 }
 
@@ -692,7 +820,7 @@ private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () 
                 }
                 Spacer(Modifier.height(15.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    if (item.receiptFile != null) {
+                    if (item.receiptMime != null) {
                         Row(Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(colors.pine)
                             .clickable(onClick = onReceipt).padding(vertical = 12.dp), horizontalArrangement = Arrangement.Center,
                             verticalAlignment = Alignment.CenterVertically) {
@@ -715,14 +843,135 @@ private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () 
 }
 
 @Composable
-private fun SharedScreen() {
+private fun SharedScreen(repo: HouseholdRepository, householdId: String) {
     val colors = LocalPalette.current
-    Column(Modifier.fillMaxSize().padding(22.dp)) {
-        BrandHeader(); Spacer(Modifier.height(30.dp)); PageLabel("Compartido"); Spacer(Modifier.height(10.dp))
-        Text("Entre los dos.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 39.sp)
-        Spacer(Modifier.height(12.dp))
-        Text("Aquí llegarán las tareas y notas. Primero estamos probando el inventario en el móvil; después conectaremos las cuentas y el espacio compartido.",
-            color = colors.muted, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 20.sp)
+    val scope = rememberCoroutineScope()
+    val tasksFlow = remember(householdId) { repo.tasksFlow(householdId) }
+    val notesFlow = remember(householdId) { repo.notesFlow(householdId) }
+    val tasks by tasksFlow.collectAsState(initial = emptyList())
+    val notes by notesFlow.collectAsState(initial = emptyList())
+    var taskInput by remember { mutableStateOf("") }
+    var noteInput by remember { mutableStateOf("") }
+    var section by remember { mutableStateOf(0) }
+    val author = repo.memberName.ifBlank { "Alguien de casa" }
+
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
+            BrandHeader()
+            Spacer(Modifier.height(30.dp))
+            PageLabel("Compartido")
+            Spacer(Modifier.height(10.dp))
+            Text("Entre los dos.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 39.sp)
+            Text("Tareas y notas al momento en los dos móviles.", color = colors.muted, fontFamily = Manrope, fontSize = 13.sp)
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth().background(colors.paper, RoundedCornerShape(14.dp)).padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf("Tareas" to 0, "Notas" to 1).forEach { (label, index) ->
+                    val selected = section == index
+                    Box(Modifier.weight(1f).clip(RoundedCornerShape(11.dp))
+                        .background(if (selected) colors.pine else Color.Transparent)
+                        .clickable { section = index }.padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+                        Text(label, color = if (selected) colors.onPine else colors.muted, fontFamily = Manrope,
+                            fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+            }
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(Modifier.weight(1f).heightIn(min = 48.dp).background(colors.paper, RoundedCornerShape(14.dp))
+                    .padding(horizontal = 15.dp, vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                    BasicTextField(if (section == 0) taskInput else noteInput,
+                        onValueChange = { if (section == 0) taskInput = it else noteInput = it }, singleLine = section == 0,
+                        textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
+                        modifier = Modifier.fillMaxWidth(),
+                        decorationBox = { inner ->
+                            if ((if (section == 0) taskInput else noteInput).isEmpty())
+                                Text(if (section == 0) "Añadir una tarea" else "Escribir una nota",
+                                    color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
+                            inner()
+                        })
+                }
+                Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(colors.pine)
+                    .clickable {
+                        val text = (if (section == 0) taskInput else noteInput).trim()
+                        if (text.isBlank()) return@clickable
+                        scope.launch {
+                            runCatching {
+                                if (section == 0) repo.addTask(householdId, text, author) else repo.addNote(householdId, text, author)
+                            }
+                        }
+                        if (section == 0) taskInput = "" else noteInput = ""
+                    }, contentAlignment = Alignment.Center) {
+                    Text("＋", color = colors.onPine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+        if (section == 0) {
+            if (tasks.isEmpty()) {
+                item { EmptySharedState("Sin tareas por ahora", "Añadid lo primero que se os ocurra para la casa.") }
+            } else {
+                items(tasks, key = { "task-" + it.id }) { task ->
+                    TaskRow(task, onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
+                        onDelete = { scope.launch { runCatching { repo.deleteTask(householdId, task.id) } } })
+                }
+            }
+        } else {
+            if (notes.isEmpty()) {
+                item { EmptySharedState("Sin notas todavía", "Dejad aquí lo que queráis recordar entre los dos.") }
+            } else {
+                items(notes, key = { "note-" + it.id }) { note ->
+                    NoteRow(note, onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptySharedState(title: String, subtitle: String) {
+    val colors = LocalPalette.current
+    Surface(color = colors.paper, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Text(title, color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Text(subtitle, color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun TaskRow(task: TaskItem, onToggle: () -> Unit, onDelete: () -> Unit) {
+    val colors = LocalPalette.current
+    Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(Modifier.size(24.dp).clip(CircleShape).background(if (task.done) colors.pine else colors.cream)
+                .clickable(onClick = onToggle), contentAlignment = Alignment.Center) {
+                if (task.done) Text("✓", color = colors.onPine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+            Column(Modifier.weight(1f)) {
+                Text(task.text, color = if (task.done) colors.muted else colors.ink, fontFamily = Manrope,
+                    fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                    textDecoration = if (task.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null)
+                if (task.createdBy.isNotBlank()) Text(task.createdBy, color = colors.muted, fontFamily = Manrope, fontSize = 10.sp)
+            }
+            Icon(painterResource(R.drawable.ic_trash), contentDescription = "Eliminar", tint = colors.muted,
+                modifier = Modifier.size(16.dp).clickable(onClick = onDelete))
+        }
+    }
+}
+
+@Composable
+private fun NoteRow(note: NoteItem, onDelete: () -> Unit) {
+    val colors = LocalPalette.current
+    Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(note.text, color = colors.ink, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 19.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(note.author.ifBlank { "Anónimo" }, color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Icon(painterResource(R.drawable.ic_trash), contentDescription = "Eliminar", tint = colors.muted,
+                    modifier = Modifier.size(14.dp).clickable(onClick = onDelete))
+            }
+        }
     }
 }
 
@@ -772,7 +1021,7 @@ private fun BottomBar(selected: Tab, onTab: (Tab) -> Unit) {
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryStore,
-    onDismiss: () -> Unit, onSave: (InventoryItem) -> Unit) {
+    onDismiss: () -> Unit, onSave: (InventoryItem, Uri?, Uri?) -> Unit, onDelete: (InventoryItem) -> Unit) {
     val colors = LocalPalette.current
     var name by remember(item?.id, purchase) { mutableStateOf(item?.name ?: "") }
     var room by remember(item?.id, purchase) { mutableStateOf(item?.room ?: "") }
@@ -788,7 +1037,6 @@ private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryS
     var error by remember(item?.id, purchase) { mutableStateOf("") }
     var saving by remember(item?.id, purchase) { mutableStateOf(false) }
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { receipt = it }
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { photo = it }
     val existingPhoto = remember(item?.id, purchase) { item?.let { store.photoUri(it) } }
@@ -819,7 +1067,7 @@ private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryS
                     }, current.year, current.monthValue - 1, current.dayOfMonth).show()
                 }) { Text("Fecha: $date", color = colors.pine, fontFamily = Manrope) }
                 TextButton(onClick = { picker.launch(arrayOf("image/*", "application/pdf")) }) {
-                    Text(if (receipt != null) "Ticket seleccionado ✓" else if (item?.receiptFile != null) "Cambiar ticket (foto o PDF)" else "Adjuntar ticket (foto o PDF)",
+                    Text(if (receipt != null) "Ticket seleccionado ✓" else if (item?.receiptMime != null) "Cambiar ticket (foto o PDF)" else "Adjuntar ticket (foto o PDF)",
                         color = colors.pine, fontFamily = Manrope)
                 }
                 OutlinedTextField(shop, onValueChange = { shop = it }, label = { Text("Tienda (opcional)") },
@@ -837,28 +1085,21 @@ private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryS
                 val cents = if (purchase) parseMoney(price) else null
                 if (purchase && cents == null) { error = "Indica un precio válido"; return@Button }
                 saving = true
-                scope.launch {
-                    try {
-                        val copiedReceipt = if (receipt != null) withContext(Dispatchers.IO) { store.copyReceipt(receipt!!) }
-                            else item?.receiptFile
-                        val copiedPhoto = if (photo != null) withContext(Dispatchers.IO) { store.copyPhoto(photo!!) }
-                            else item?.photoFile
-                        val value = (item ?: InventoryItem(name = name.trim())).copy(
-                            name = name.trim(), room = room.trim(), category = category.trim(),
-                            status = if (purchase) ItemStatus.PURCHASED else ItemStatus.PLANNED,
-                            priceCents = cents, purchaseDate = if (purchase) date else null,
-                            receiptFile = copiedReceipt, photoFile = copiedPhoto, shop = shop.trim(),
-                            description = description.trim(), location = location.trim(), purpose = purpose.trim(),
-                        )
-                        onSave(value)
-                    } catch (failure: Exception) {
-                        error = "No se pudo guardar. Comprueba el ticket o la foto e inténtalo de nuevo."
-                        saving = false
-                    }
-                }
+                val value = (item ?: InventoryItem(name = name.trim())).copy(
+                    name = name.trim(), room = room.trim(), category = category.trim(),
+                    status = if (purchase) ItemStatus.PURCHASED else ItemStatus.PLANNED,
+                    priceCents = cents, purchaseDate = if (purchase) date else null,
+                    shop = shop.trim(), description = description.trim(), location = location.trim(), purpose = purpose.trim(),
+                )
+                onSave(value, photo, receipt)
             }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine), modifier = Modifier.fillMaxWidth()) {
                 Text(if (purchase) "Guardar compra" else "Añadir a pendientes", fontFamily = Manrope,
                     fontWeight = FontWeight.Bold)
+            }
+            if (item != null) {
+                TextButton(onClick = { onDelete(item) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Eliminar artículo", color = colors.danger, fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                }
             }
             Spacer(Modifier.height(12.dp))
         }
@@ -1058,7 +1299,7 @@ private fun WishlistItemCard(item: WishlistItem, store: InventoryStore, onEdit: 
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-private fun WishlistSheet(item: WishlistItem?, store: InventoryStore, onDismiss: () -> Unit, onSave: (WishlistItem) -> Unit) {
+private fun WishlistSheet(item: WishlistItem?, store: InventoryStore, onDismiss: () -> Unit, onSave: (WishlistItem, Uri?) -> Unit) {
     val colors = LocalPalette.current
     var name by remember(item?.id) { mutableStateOf(item?.name ?: "") }
     var url by remember(item?.id) { mutableStateOf(item?.url ?: "") }
@@ -1070,7 +1311,6 @@ private fun WishlistSheet(item: WishlistItem?, store: InventoryStore, onDismiss:
     var photo by remember(item?.id) { mutableStateOf<Uri?>(null) }
     var error by remember(item?.id) { mutableStateOf("") }
     var saving by remember(item?.id) { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { photo = it }
     val existingPhoto = remember(item?.id) { item?.let { store.wishlistPhotoUri(it) } }
 
@@ -1102,20 +1342,11 @@ private fun WishlistSheet(item: WishlistItem?, store: InventoryStore, onDismiss:
             Button(enabled = !saving, onClick = {
                 if (name.isBlank()) { error = "Escribe el nombre del artículo"; return@Button }
                 saving = true
-                scope.launch {
-                    try {
-                        val copiedPhoto = if (photo != null) withContext(Dispatchers.IO) { store.copyWishlistPhoto(photo!!) }
-                            else item?.photoFile
-                        val value = (item ?: WishlistItem(name = name.trim())).copy(
-                            name = name.trim(), url = url.trim(), shop = shop.trim(), location = location.trim(),
-                            priceCents = parseMoney(price), notes = notes.trim(), addedBy = addedBy.trim(), photoFile = copiedPhoto,
-                        )
-                        onSave(value)
-                    } catch (failure: Exception) {
-                        error = "No se pudo guardar. Comprueba la foto e inténtalo de nuevo."
-                        saving = false
-                    }
-                }
+                val value = (item ?: WishlistItem(name = name.trim())).copy(
+                    name = name.trim(), url = url.trim(), shop = shop.trim(), location = location.trim(),
+                    priceCents = parseMoney(price), notes = notes.trim(), addedBy = addedBy.trim(),
+                )
+                onSave(value, photo)
             }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine), modifier = Modifier.fillMaxWidth()) {
                 Text(if (item == null) "Añadir a deseados" else "Guardar cambios", fontFamily = Manrope, fontWeight = FontWeight.Bold)
             }
@@ -1154,7 +1385,7 @@ private fun HomePreview() {
     HomeScreen(listOf(
         InventoryItem(name = "Mesa de centro", room = "Salón", category = "Muebles", status = ItemStatus.PURCHASED,
             priceCents = 8900, purchaseDate = "2026-09-10", shop = "IKEA", location = "Salón, junto al sofá",
-            purpose = "Apoyar cosas y decorar", description = "Mesa redonda de madera clara.", receiptFile = "demo.jpg"),
+            purpose = "Apoyar cosas y decorar", description = "Mesa redonda de madera clara.", receiptMime = "image/jpeg"),
         InventoryItem(name = "Lámpara de pie", room = "Dormitorio", category = "Iluminación", status = ItemStatus.PURCHASED,
             priceCents = 3200, purchaseDate = "2026-09-05", shop = "Leroy Merlin"),
     ), store, onAddPurchase = {}, onEdit = {}, onReceipt = {}, onExport = {})

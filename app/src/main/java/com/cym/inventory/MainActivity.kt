@@ -8,6 +8,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val store = InventoryStore(applicationContext)
-        setContent { InventoryApp(store) }
+        val repo = HouseholdRepository(applicationContext, store)
+        setContent { AppRoot(store, repo) }
     }
 }
