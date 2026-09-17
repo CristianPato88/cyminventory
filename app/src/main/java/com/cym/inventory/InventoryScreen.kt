@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateContentSize
@@ -54,6 +55,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -152,7 +154,9 @@ private enum class Tab(val title: String, val icon: Int) {
 @Composable
 internal fun AppRoot(store: InventoryStore, repo: HouseholdRepository) {
     var householdId by remember { mutableStateOf(repo.householdId) }
-    val darkTheme = isSystemInDarkTheme()
+    val context = LocalContext.current
+    var darkOverride by remember { mutableStateOf(ThemePrefs.getOverride(context)) }
+    val darkTheme = darkOverride ?: isSystemInDarkTheme()
     val colors = if (darkTheme) DarkPalette else LightPalette
     val scheme = if (darkTheme) {
         darkColorScheme(primary = colors.pine, onPrimary = colors.onPine, surface = colors.paper,
@@ -167,7 +171,11 @@ internal fun AppRoot(store: InventoryStore, repo: HouseholdRepository) {
             if (id == null) {
                 HouseholdOnboardingScreen(repo, onReady = { householdId = it })
             } else {
-                InventoryApp(store, repo, id)
+                InventoryApp(store, repo, id, darkTheme, onToggleTheme = {
+                    val newValue = !darkTheme
+                    ThemePrefs.setOverride(context, newValue)
+                    darkOverride = newValue
+                })
             }
         }
     }
@@ -183,6 +191,8 @@ private fun HouseholdOnboardingScreen(repo: HouseholdRepository, onReady: (Strin
     var error by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     var createdCode by remember { mutableStateOf<String?>(null) }
+    var photo by remember { mutableStateOf<Uri?>(null) }
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { photo = it }
     val scope = rememberCoroutineScope()
 
     Column(Modifier.fillMaxSize().background(colors.cream).windowInsetsPadding(WindowInsets.safeDrawing)
@@ -232,6 +242,8 @@ private fun HouseholdOnboardingScreen(repo: HouseholdRepository, onReady: (Strin
                     else "Introduce el código de 8 caracteres que os han compartido.",
                     color = colors.muted, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 19.sp)
                 Spacer(Modifier.height(22.dp))
+                ProfilePhotoPicker(name, photo, onPick = { photoPicker.launch("image/*") })
+                Spacer(Modifier.height(14.dp))
                 OutlinedTextField(name, onValueChange = { name = it }, label = { Text("Tu nombre") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
                 if (mode == 2) {
@@ -252,9 +264,9 @@ private fun HouseholdOnboardingScreen(repo: HouseholdRepository, onReady: (Strin
                     scope.launch {
                         try {
                             if (mode == 1) {
-                                createdCode = repo.createHousehold(name.trim())
+                                createdCode = repo.createHousehold(name.trim(), photo)
                             } else {
-                                if (repo.joinHousehold(code.trim(), name.trim())) onReady(repo.householdId!!)
+                                if (repo.joinHousehold(code.trim(), name.trim(), photo)) onReady(repo.householdId!!)
                                 else error = "No encontramos ese código. Revísalo con la otra persona."
                             }
                         } catch (e: Exception) {
@@ -276,7 +288,8 @@ private fun HouseholdOnboardingScreen(repo: HouseholdRepository, onReady: (Strin
 }
 
 @Composable
-internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, householdId: String) {
+internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, householdId: String,
+    darkTheme: Boolean, onToggleTheme: () -> Unit) {
     val colors = LocalPalette.current
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -292,6 +305,13 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
     var wishlistSheetItem by remember { mutableStateOf<WishlistItem?>(null) }
     var wishlistSheetOpen by remember { mutableStateOf(false) }
 
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    LaunchedEffect(householdId) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     fun openSheet(item: InventoryItem?, purchase: Boolean) {
         sheetItem = item
         sheetPurchase = purchase
@@ -299,8 +319,11 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
     }
     fun saveItem(item: InventoryItem, pickedPhoto: Uri?, pickedReceipt: Uri?) {
         sheetOpen = false
+        val toSave = if (item.status == ItemStatus.PURCHASED && item.paidBy.isBlank())
+            item.copy(paidBy = repo.memberName.ifBlank { "Alguien de casa" }, paidById = repo.memberId)
+        else item
         scope.launch {
-            runCatching { repo.saveItem(householdId, item, pickedPhoto, pickedReceipt) }
+            runCatching { repo.saveItem(householdId, toSave, pickedPhoto, pickedReceipt) }
                 .onFailure { receiptError = "No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo." }
         }
     }
@@ -377,8 +400,15 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
                 Tab.WISHLIST -> WishlistScreen(wishlist, store,
                     onAdd = { openWishlistSheet(null) }, onEdit = { openWishlistSheet(it) },
                     onDelete = ::deleteWishlistItem, onMoveToPending = ::moveWishlistToPending)
-                Tab.SHARED -> SharedScreen(repo, householdId)
+                Tab.SHARED -> SharedScreen(store, repo, householdId)
                 Tab.EXPENSES -> ExpenseScreen(items.filter { it.status == ItemStatus.PURCHASED })
+            }
+            Box(Modifier.align(Alignment.TopEnd).padding(top = 20.dp, end = 20.dp).size(38.dp)
+                .clip(CircleShape).background(colors.paper).clickable(onClick = onToggleTheme),
+                contentAlignment = Alignment.Center) {
+                Icon(painterResource(if (darkTheme) R.drawable.ic_sun else R.drawable.ic_moon),
+                    contentDescription = if (darkTheme) "Cambiar a modo claro" else "Cambiar a modo oscuro",
+                    tint = colors.pine, modifier = Modifier.size(18.dp))
             }
         }
         BottomBar(tab, onTab = { tab = it })
@@ -843,17 +873,41 @@ private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () 
 }
 
 @Composable
-private fun SharedScreen(repo: HouseholdRepository, householdId: String) {
+private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, householdId: String) {
     val colors = LocalPalette.current
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var hasLocationPermission by remember { mutableStateOf(LocationUtil.hasPermission(context)) }
+    val backgroundLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    val fineLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        hasLocationPermission = results.values.any { it }
+        if (hasLocationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            backgroundLocationLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        }
+    }
     val tasksFlow = remember(householdId) { repo.tasksFlow(householdId) }
     val notesFlow = remember(householdId) { repo.notesFlow(householdId) }
+    val membersFlow = remember(householdId) { repo.membersFlow(householdId) }
     val tasks by tasksFlow.collectAsState(initial = emptyList())
     val notes by notesFlow.collectAsState(initial = emptyList())
+    val members by membersFlow.collectAsState(initial = emptyList())
+    val membersById = remember(members) { members.associateBy { it.id } }
     var taskInput by remember { mutableStateOf("") }
     var noteInput by remember { mutableStateOf("") }
     var section by remember { mutableStateOf(0) }
+    var editingProfile by remember { mutableStateOf(false) }
+    var locationStatus by remember { mutableStateOf("") }
+    var taskRecurrence by remember { mutableStateOf<Int?>(null) }
+    var taskAssignee by remember { mutableStateOf<Member?>(null) }
     val author = repo.memberName.ifBlank { "Alguien de casa" }
+    val ownMember = membersById[repo.memberId]
+
+    LaunchedEffect(tasks) {
+        val now = System.currentTimeMillis()
+        tasks.filter { it.done && it.recurrenceDays != null && it.doneAt != null &&
+            now - it.doneAt >= it.recurrenceDays.toLong() * 86_400_000L }
+            .forEach { due -> runCatching { repo.setTaskDone(householdId, due.id, false) } }
+    }
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
@@ -863,10 +917,22 @@ private fun SharedScreen(repo: HouseholdRepository, householdId: String) {
             Spacer(Modifier.height(10.dp))
             Text("Entre los dos.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 39.sp)
             Text("Tareas y notas al momento en los dos móviles.", color = colors.muted, fontFamily = Manrope, fontSize = 13.sp)
+            Spacer(Modifier.height(16.dp))
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.paper)
+                .clickable { editingProfile = true }.padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Box(Modifier.size(38.dp).clip(CircleShape).background(colors.mint)) {
+                    PhotoAvatar(author, ownMember?.let(store::memberPhotoUri), Modifier.fillMaxSize(), colors.pineLight, 14.sp)
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(author, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("Tu perfil · toca para cambiar tu foto", color = colors.muted, fontFamily = Manrope, fontSize = 10.sp)
+                }
+            }
             Spacer(Modifier.height(18.dp))
             Row(Modifier.fillMaxWidth().background(colors.paper, RoundedCornerShape(14.dp)).padding(4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                listOf("Tareas" to 0, "Notas" to 1).forEach { (label, index) ->
+                listOf("Tareas" to 0, "Notas" to 1, "Dónde estoy" to 2).forEach { (label, index) ->
                     val selected = section == index
                     Box(Modifier.weight(1f).clip(RoundedCornerShape(11.dp))
                         .background(if (selected) colors.pine else Color.Transparent)
@@ -877,54 +943,218 @@ private fun SharedScreen(repo: HouseholdRepository, householdId: String) {
                 }
             }
             Spacer(Modifier.height(18.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Box(Modifier.weight(1f).heightIn(min = 48.dp).background(colors.paper, RoundedCornerShape(14.dp))
-                    .padding(horizontal = 15.dp, vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
-                    BasicTextField(if (section == 0) taskInput else noteInput,
-                        onValueChange = { if (section == 0) taskInput = it else noteInput = it }, singleLine = section == 0,
-                        textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
-                        modifier = Modifier.fillMaxWidth(),
-                        decorationBox = { inner ->
-                            if ((if (section == 0) taskInput else noteInput).isEmpty())
-                                Text(if (section == 0) "Añadir una tarea" else "Escribir una nota",
-                                    color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
-                            inner()
-                        })
+            if (section == 0) {
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(null to "No repetir", 1 to "↻ Diaria", 7 to "↻ Semanal", 30 to "↻ Mensual").forEach { (days, label) ->
+                        val selected = taskRecurrence == days
+                        Box(Modifier.clip(RoundedCornerShape(10.dp)).background(if (selected) colors.pine else colors.paper)
+                            .clickable { taskRecurrence = days }.padding(horizontal = 12.dp, vertical = 7.dp)) {
+                            Text(label, color = if (selected) colors.onPine else colors.muted, fontFamily = Manrope,
+                                fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        }
+                    }
                 }
-                Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(colors.pine)
-                    .clickable {
-                        val text = (if (section == 0) taskInput else noteInput).trim()
-                        if (text.isBlank()) return@clickable
-                        scope.launch {
-                            runCatching {
-                                if (section == 0) repo.addTask(householdId, text, author) else repo.addNote(householdId, text, author)
+                Spacer(Modifier.height(8.dp))
+                if (members.size > 1) {
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        (listOf<Member?>(null) + members).forEach { m ->
+                            val selected = taskAssignee?.id == m?.id
+                            Box(Modifier.clip(RoundedCornerShape(10.dp)).background(if (selected) colors.pine else colors.paper)
+                                .clickable { taskAssignee = m }.padding(horizontal = 12.dp, vertical = 7.dp)) {
+                                Text(m?.name?.let { "Para: $it" } ?: "Para cualquiera",
+                                    color = if (selected) colors.onPine else colors.muted, fontFamily = Manrope,
+                                    fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             }
                         }
-                        if (section == 0) taskInput = "" else noteInput = ""
-                    }, contentAlignment = Alignment.Center) {
-                    Text("＋", color = colors.onPine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    }
+                    Spacer(Modifier.height(8.dp))
                 }
             }
-            Spacer(Modifier.height(6.dp))
+            if (section != 2) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Box(Modifier.weight(1f).heightIn(min = 48.dp).background(colors.paper, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 15.dp, vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                        BasicTextField(if (section == 0) taskInput else noteInput,
+                            onValueChange = { if (section == 0) taskInput = it else noteInput = it }, singleLine = section == 0,
+                            textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
+                            modifier = Modifier.fillMaxWidth(),
+                            decorationBox = { inner ->
+                                if ((if (section == 0) taskInput else noteInput).isEmpty())
+                                    Text(if (section == 0) "Añadir una tarea" else "Escribir una nota",
+                                        color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
+                                inner()
+                            })
+                    }
+                    Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(colors.pine)
+                        .clickable {
+                            val text = (if (section == 0) taskInput else noteInput).trim()
+                            if (text.isBlank()) return@clickable
+                            scope.launch {
+                                runCatching {
+                                    if (section == 0) repo.addTask(householdId, text, author, taskRecurrence,
+                                        taskAssignee?.name ?: "", taskAssignee?.id ?: "")
+                                    else repo.addNote(householdId, text, author)
+                                }
+                            }
+                            if (section == 0) { taskInput = ""; taskRecurrence = null; taskAssignee = null } else noteInput = ""
+                        }, contentAlignment = Alignment.Center) {
+                        Text("＋", color = colors.onPine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
         }
         if (section == 0) {
             if (tasks.isEmpty()) {
                 item { EmptySharedState("Sin tareas por ahora", "Añadid lo primero que se os ocurra para la casa.") }
             } else {
                 items(tasks, key = { "task-" + it.id }) { task ->
-                    TaskRow(task, onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
+                    TaskRow(task, membersById[task.createdById]?.let(store::memberPhotoUri),
+                        onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
                         onDelete = { scope.launch { runCatching { repo.deleteTask(householdId, task.id) } } })
                 }
             }
-        } else {
+        } else if (section == 1) {
             if (notes.isEmpty()) {
                 item { EmptySharedState("Sin notas todavía", "Dejad aquí lo que queráis recordar entre los dos.") }
             } else {
                 items(notes, key = { "note-" + it.id }) { note ->
-                    NoteRow(note, onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
+                    NoteRow(note, membersById[note.authorId]?.let(store::memberPhotoUri),
+                        onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
+                }
+            }
+        } else {
+            item {
+                LocationScreen(members, repo.memberId, hasLocationPermission, locationStatus,
+                    onRequestPermission = { fineLocationLauncher.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) },
+                    onShareNow = {
+                        locationStatus = "Buscando tu ubicación…"
+                        scope.launch {
+                            val location = LocationUtil.getCurrentLocation(context)
+                            if (location == null) {
+                                locationStatus = "No se pudo obtener tu ubicación. Comprueba que la ubicación esté activada en el sistema e inténtalo de nuevo."
+                                return@launch
+                            }
+                            runCatching { repo.updateMemberLocation(householdId, location.latitude, location.longitude) }
+                                .onSuccess { locationStatus = "Ubicación compartida." }
+                                .onFailure { locationStatus = "No se pudo guardar tu ubicación. Comprueba tu conexión." }
+                        }
+                    })
+            }
+        }
+    }
+    if (editingProfile) {
+        ProfileSheet(initialName = author, initialPhoto = ownMember?.let(store::memberPhotoUri),
+            onDismiss = { editingProfile = false },
+            onSave = { newName, newPhoto ->
+                editingProfile = false
+                scope.launch { runCatching { repo.saveMemberProfile(householdId, newName, newPhoto) } }
+            })
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ProfileSheet(initialName: String, initialPhoto: Uri?,
+    onDismiss: () -> Unit, onSave: (String, Uri?) -> Unit) {
+    val colors = LocalPalette.current
+    var name by remember { mutableStateOf(initialName) }
+    var photo by remember { mutableStateOf(initialPhoto) }
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { photo = it }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.cream) {
+        Column(Modifier.fillMaxWidth().padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text("Tu perfil", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+            ProfilePhotoPicker(name, photo, onPick = { photoPicker.launch("image/*") })
+            OutlinedTextField(name, onValueChange = { name = it }, label = { Text("Tu nombre") },
+                singleLine = true, modifier = Modifier.fillMaxWidth())
+            Button(enabled = name.isNotBlank(), onClick = { onSave(name.trim(), photo) },
+                colors = ButtonDefaults.buttonColors(containerColor = colors.pine), modifier = Modifier.fillMaxWidth()) {
+                Text("Guardar", fontFamily = Manrope, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(4.dp))
+        }
+    }
+}
+
+@Composable
+private fun LocationScreen(members: List<Member>, ownMemberId: String, hasLocationPermission: Boolean, statusMessage: String,
+    onRequestPermission: () -> Unit, onShareNow: () -> Unit) {
+    val colors = LocalPalette.current
+    val located = members.filter { it.lat != null && it.lng != null }
+
+    Column(Modifier.fillMaxWidth()) {
+        if (!hasLocationPermission) {
+            Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Activa la ubicación", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Text("Para ver dónde está cada uno hace falta el permiso de ubicación. Se comparte de forma aproximada cada 15 minutos, incluso con la app cerrada.",
+                        color = colors.muted, fontFamily = Manrope, fontSize = 12.sp, lineHeight = 17.sp)
+                    Button(onClick = onRequestPermission, colors = ButtonDefaults.buttonColors(containerColor = colors.pine)) {
+                        Text("Activar ubicación", fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+        } else {
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.paper)
+                .clickable(onClick = onShareNow).padding(14.dp), horizontalArrangement = Arrangement.Center) {
+                Text("Compartir mi ubicación ahora", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
+            if (statusMessage.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(statusMessage, color = colors.muted, fontFamily = Manrope, fontSize = 11.sp, lineHeight = 15.sp)
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+        if (located.isEmpty()) {
+            EmptySharedState("Sin ubicaciones todavía", "En cuanto alguien comparta su ubicación, aparecerá aquí en el mapa.")
+        } else {
+            val target = located.firstOrNull { it.id == ownMemberId } ?: located.first()
+            androidx.compose.ui.viewinterop.AndroidView(
+                modifier = Modifier.fillMaxWidth().height(320.dp).clip(RoundedCornerShape(16.dp)),
+                factory = { ctx -> org.osmdroid.views.MapView(ctx).apply { setMultiTouchControls(true) } },
+                update = { mapView ->
+                    mapView.overlays.clear()
+                    located.forEach { member ->
+                        val marker = org.osmdroid.views.overlay.Marker(mapView)
+                        marker.position = org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!)
+                        marker.title = member.name
+                        mapView.overlays.add(marker)
+                    }
+                    mapView.controller.setZoom(14.0)
+                    mapView.controller.setCenter(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
+                    mapView.invalidate()
+                },
+                onRelease = { mapView -> mapView.onDetach() },
+            )
+            Spacer(Modifier.height(12.dp))
+            members.forEach { member ->
+                Surface(color = colors.paper, shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Box(Modifier.size(28.dp).clip(CircleShape).background(colors.mint))
+                        Column(Modifier.weight(1f)) {
+                            Text(member.name, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text(
+                                if (member.locationUpdatedAt != null) "Actualizado ${timeAgo(member.locationUpdatedAt)}" else "Aún no ha compartido su ubicación",
+                                color = colors.muted, fontFamily = Manrope, fontSize = 10.sp,
+                            )
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+private fun timeAgo(timestamp: Long): String {
+    val minutes = (System.currentTimeMillis() - timestamp) / 60_000
+    return when {
+        minutes < 1 -> "hace un momento"
+        minutes < 60 -> "hace $minutes min"
+        minutes < 24 * 60 -> "hace ${minutes / 60} h"
+        else -> "hace ${minutes / (24 * 60)} d"
     }
 }
 
@@ -939,8 +1169,16 @@ private fun EmptySharedState(title: String, subtitle: String) {
     }
 }
 
+private fun recurrenceLabel(days: Int?): String? = when (days) {
+    null -> null
+    1 -> "↻ Diaria"
+    7 -> "↻ Semanal"
+    30 -> "↻ Mensual"
+    else -> "↻ cada ${days}d"
+}
+
 @Composable
-private fun TaskRow(task: TaskItem, onToggle: () -> Unit, onDelete: () -> Unit) {
+private fun TaskRow(task: TaskItem, authorPhoto: Uri?, onToggle: () -> Unit, onDelete: () -> Unit) {
     val colors = LocalPalette.current
     Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -953,6 +1191,14 @@ private fun TaskRow(task: TaskItem, onToggle: () -> Unit, onDelete: () -> Unit) 
                     fontWeight = FontWeight.Bold, fontSize = 13.sp,
                     textDecoration = if (task.done) androidx.compose.ui.text.style.TextDecoration.LineThrough else null)
                 if (task.createdBy.isNotBlank()) Text(task.createdBy, color = colors.muted, fontFamily = Manrope, fontSize = 10.sp)
+                if (task.assignedTo.isNotBlank()) Text("Para: ${task.assignedTo}", color = colors.pineLight,
+                    fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                recurrenceLabel(task.recurrenceDays)?.let { Text(it, color = colors.pineLight, fontFamily = Manrope, fontSize = 10.sp) }
+            }
+            if (task.createdBy.isNotBlank()) {
+                Box(Modifier.size(26.dp).clip(CircleShape).background(colors.mint)) {
+                    PhotoAvatar(task.createdBy, authorPhoto, Modifier.fillMaxSize(), colors.pineLight, 10.sp)
+                }
             }
             Icon(painterResource(R.drawable.ic_trash), contentDescription = "Eliminar", tint = colors.muted,
                 modifier = Modifier.size(16.dp).clickable(onClick = onDelete))
@@ -961,13 +1207,18 @@ private fun TaskRow(task: TaskItem, onToggle: () -> Unit, onDelete: () -> Unit) 
 }
 
 @Composable
-private fun NoteRow(note: NoteItem, onDelete: () -> Unit) {
+private fun NoteRow(note: NoteItem, authorPhoto: Uri?, onDelete: () -> Unit) {
     val colors = LocalPalette.current
     Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(note.text, color = colors.ink, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 19.sp)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(note.author.ifBlank { "Anónimo" }, color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(Modifier.size(20.dp).clip(CircleShape).background(colors.mint)) {
+                        PhotoAvatar(note.author.ifBlank { "?" }, authorPhoto, Modifier.fillMaxSize(), colors.pineLight, 9.sp)
+                    }
+                    Text(note.author.ifBlank { "Anónimo" }, color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                }
                 Icon(painterResource(R.drawable.ic_trash), contentDescription = "Eliminar", tint = colors.muted,
                     modifier = Modifier.size(14.dp).clickable(onClick = onDelete))
             }
@@ -979,7 +1230,13 @@ private fun NoteRow(note: NoteItem, onDelete: () -> Unit) {
 private fun ExpenseScreen(items: List<InventoryItem>) {
     val colors = LocalPalette.current
     val total = items.sumOf { it.priceCents ?: 0L }
-    Column(Modifier.fillMaxSize().padding(22.dp)) {
+    val attributed = items.filter { it.paidBy.isNotBlank() }
+    val byPayer = attributed.groupBy { it.paidBy }.mapValues { (_, list) -> list.sumOf { it.priceCents ?: 0L } }
+    val totalAttributed = byPayer.values.sum()
+    val fairShare = if (byPayer.isNotEmpty()) totalAttributed / byPayer.size else 0L
+    val unassignedCount = items.size - attributed.size
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp)) {
         BrandHeader(); Spacer(Modifier.height(30.dp)); PageLabel("Gastos"); Spacer(Modifier.height(10.dp))
         Text("Cada compra cuenta.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 35.sp)
         Spacer(Modifier.height(20.dp))
@@ -992,8 +1249,56 @@ private fun ExpenseScreen(items: List<InventoryItem>) {
             }
         }
         Spacer(Modifier.height(18.dp))
-        Text("El desglose por categoría y mes llegará con la sincronización.", color = colors.muted,
-            fontFamily = Manrope, fontSize = 12.sp)
+        if (byPayer.isEmpty()) {
+            Text("Cuando registréis quién paga cada compra, aquí veréis el reparto entre los dos.",
+                color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
+        } else {
+            PageLabel("Quién ha pagado")
+            Spacer(Modifier.height(10.dp))
+            byPayer.entries.sortedByDescending { it.value }.forEach { (name, paid) ->
+                val balance = paid - fairShare
+                Surface(color = colors.paper, shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(14.dp), horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Column {
+                            Text(name, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("Ha pagado ${formatMoney(paid)}", color = colors.muted, fontFamily = Manrope, fontSize = 11.sp)
+                        }
+                        if (byPayer.size > 1) {
+                            Text(
+                                when {
+                                    balance > 0 -> "+${formatMoney(balance)}"
+                                    balance < 0 -> "-${formatMoney(-balance)}"
+                                    else -> "Al día"
+                                },
+                                color = if (balance > 0) colors.pine else if (balance < 0) colors.danger else colors.muted,
+                                fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                            )
+                        }
+                    }
+                }
+            }
+            if (byPayer.size == 2) {
+                val sorted = byPayer.entries.sortedByDescending { it.value }.toList()
+                val diff = sorted[0].value - sorted[1].value
+                Spacer(Modifier.height(4.dp))
+                if (diff > 0) {
+                    Surface(color = colors.pine, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+                        Text("${sorted[1].key} le debe ${formatMoney(diff / 2)} a ${sorted[0].key}",
+                            color = colors.paper, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp,
+                            modifier = Modifier.padding(14.dp))
+                    }
+                } else {
+                    Text("Vais igualados, ¡bien repartido!", color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
+                }
+            }
+        }
+        if (unassignedCount > 0) {
+            Spacer(Modifier.height(10.dp))
+            Text("$unassignedCount compra(s) sin persona asignada (de antes de esta actualización).",
+                color = colors.muted, fontFamily = Manrope, fontSize = 11.sp)
+        }
     }
 }
 
@@ -1131,6 +1436,19 @@ private fun PhotoAvatar(name: String, photoUri: Uri?, modifier: Modifier, letter
         } else {
             Text(name.take(1).uppercase(), fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = letterSize, color = letterColor)
         }
+    }
+}
+
+@Composable
+private fun ProfilePhotoPicker(name: String, source: Uri?, onPick: () -> Unit) {
+    val colors = LocalPalette.current
+    Row(Modifier.fillMaxWidth().clickable(onClick = onPick), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.size(56.dp).clip(CircleShape).background(colors.mint)) {
+            PhotoAvatar(name.ifBlank { "?" }, source, Modifier.fillMaxSize(), colors.pineLight, 20.sp)
+        }
+        Text(if (source != null) "Cambiar tu foto" else "Añadir tu foto (opcional)",
+            color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
     }
 }
 

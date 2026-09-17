@@ -22,14 +22,29 @@ internal data class TaskItem(
     val text: String,
     val done: Boolean = false,
     val createdBy: String = "",
+    val createdById: String = "",
     val createdAt: Long = System.currentTimeMillis(),
+    val recurrenceDays: Int? = null,
+    val doneAt: Long? = null,
+    val assignedTo: String = "",
+    val assignedToId: String = "",
 )
 
 internal data class NoteItem(
     val id: String = UUID.randomUUID().toString(),
     val text: String,
     val author: String = "",
+    val authorId: String = "",
     val createdAt: Long = System.currentTimeMillis(),
+)
+
+internal data class Member(
+    val id: String,
+    val name: String,
+    val photoMime: String? = null,
+    val lat: Double? = null,
+    val lng: Double? = null,
+    val locationUpdatedAt: Long? = null,
 )
 
 private val CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ" // sin 0/O ni 1/I/L, para que se lea y teclee sin líos
@@ -43,12 +58,13 @@ internal class HouseholdRepository(private val context: Context, private val sto
 
     val householdId: String? get() = prefs.getString("householdId", null)
     val memberName: String get() = prefs.getString("memberName", "") ?: ""
+    val memberId: String get() = auth.currentUser?.uid ?: ""
 
     private suspend fun ensureSignedIn() {
         if (auth.currentUser == null) auth.signInAnonymously().await()
     }
 
-    suspend fun createHousehold(name: String): String = withContext(Dispatchers.IO) {
+    suspend fun createHousehold(name: String, photo: Uri? = null): String = withContext(Dispatchers.IO) {
         ensureSignedIn()
         var code = generateHouseholdCode()
         var attempts = 0
@@ -61,25 +77,62 @@ internal class HouseholdRepository(private val context: Context, private val sto
             "createdAt" to System.currentTimeMillis(),
         )).await()
         saveLocalHousehold(code, name)
+        saveMemberProfile(code, name, photo)
         migrateLocalData(code)
         code
     }
 
-    suspend fun joinHousehold(code: String, name: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun joinHousehold(code: String, name: String, photo: Uri? = null): Boolean = withContext(Dispatchers.IO) {
         ensureSignedIn()
         val normalized = code.trim().uppercase()
         val doc = db.collection("households").document(normalized).get().await()
         if (!doc.exists()) return@withContext false
         saveLocalHousehold(normalized, name)
+        saveMemberProfile(normalized, name, photo)
         true
+    }
+
+    // ---------- Members ----------
+
+    fun membersFlow(householdId: String): Flow<List<Member>> =
+        db.collection("households").document(householdId).collection("members")
+            .snapshots().map { snapshot -> snapshot.documents.mapNotNull { it.toMember() } }
+
+    /** Saves this device's member profile (name + optional photo); safe to call again later to edit it. */
+    suspend fun saveMemberProfile(householdId: String, name: String, pickedPhoto: Uri?) = withContext(Dispatchers.IO) {
+        ensureSignedIn()
+        val id = memberId
+        if (id.isBlank()) return@withContext
+        var photoMime: String? = null
+        var photoBase64: Any? = null
+        if (pickedPhoto != null) {
+            photoMime = store.cachePickedFile(pickedPhoto, "member-photos", id)
+            photoBase64 = store.prepareUpload("member-photos", id, photoMime)
+        }
+        val data = mutableMapOf<String, Any?>("name" to name)
+        if (photoMime != null) data["photoMime"] = photoMime
+        if (photoBase64 != null) data["photoData"] = photoBase64
+        db.collection("households").document(householdId).collection("members").document(id)
+            .set(data, SetOptions.merge()).await()
+        prefs.edit().putString("memberName", name).apply()
     }
 
     fun leaveHousehold() {
         prefs.edit().clear().apply()
     }
 
+    /** Updates this device's last known location on its member profile. */
+    suspend fun updateMemberLocation(householdId: String, lat: Double, lng: Double) = withContext(Dispatchers.IO) {
+        val id = memberId
+        if (id.isBlank()) return@withContext
+        db.collection("households").document(householdId).collection("members").document(id)
+            .set(mapOf("lat" to lat, "lng" to lng, "locationUpdatedAt" to System.currentTimeMillis()), SetOptions.merge())
+            .await()
+    }
+
     private fun saveLocalHousehold(code: String, name: String) {
-        prefs.edit().putString("householdId", code).putString("memberName", name).apply()
+        prefs.edit().putString("householdId", code).putString("memberName", name)
+            .putLong("lastSyncCheck", System.currentTimeMillis()).apply()
     }
 
     private suspend fun migrateLocalData(householdId: String) {
@@ -153,15 +206,18 @@ internal class HouseholdRepository(private val context: Context, private val sto
             .orderBy("createdAt", Query.Direction.DESCENDING)
             .snapshots().map { snapshot -> snapshot.documents.mapNotNull { it.toTaskItem() } }
 
-    suspend fun addTask(householdId: String, text: String, author: String) = withContext(Dispatchers.IO) {
-        val task = TaskItem(text = text, createdBy = author)
+    suspend fun addTask(householdId: String, text: String, author: String, recurrenceDays: Int? = null,
+        assignedTo: String = "", assignedToId: String = "") = withContext(Dispatchers.IO) {
+        val task = TaskItem(text = text, createdBy = author, createdById = memberId,
+            recurrenceDays = recurrenceDays, assignedTo = assignedTo, assignedToId = assignedToId)
         db.collection("households").document(householdId).collection("tasks").document(task.id)
             .set(task.toMap()).await()
     }
 
     suspend fun setTaskDone(householdId: String, taskId: String, done: Boolean) = withContext(Dispatchers.IO) {
+        val doneAt: Any = if (done) System.currentTimeMillis() else com.google.firebase.firestore.FieldValue.delete()
         db.collection("households").document(householdId).collection("tasks").document(taskId)
-            .update("done", done).await()
+            .update(mapOf("done" to done, "doneAt" to doneAt)).await()
     }
 
     suspend fun deleteTask(householdId: String, taskId: String) = withContext(Dispatchers.IO) {
@@ -176,7 +232,7 @@ internal class HouseholdRepository(private val context: Context, private val sto
             .snapshots().map { snapshot -> snapshot.documents.mapNotNull { it.toNoteItem() } }
 
     suspend fun addNote(householdId: String, text: String, author: String) = withContext(Dispatchers.IO) {
-        val note = NoteItem(text = text, author = author)
+        val note = NoteItem(text = text, author = author, authorId = memberId)
         db.collection("households").document(householdId).collection("notes").document(note.id)
             .set(note.toMap()).await()
     }
@@ -192,6 +248,7 @@ internal class HouseholdRepository(private val context: Context, private val sto
         "priceCents" to priceCents, "purchaseDate" to purchaseDate,
         "receiptMime" to receiptMime, "photoMime" to photoMime,
         "shop" to shop, "description" to description, "location" to location, "purpose" to purpose,
+        "paidBy" to paidBy, "paidById" to paidById,
         "updatedAt" to updatedAt,
     )
 
@@ -215,6 +272,8 @@ internal class HouseholdRepository(private val context: Context, private val sto
             description = getString("description") ?: "",
             location = getString("location") ?: "",
             purpose = getString("purpose") ?: "",
+            paidBy = getString("paidBy") ?: "",
+            paidById = getString("paidById") ?: "",
             updatedAt = getLong("updatedAt") ?: 0L,
         )
     }
@@ -245,22 +304,34 @@ internal class HouseholdRepository(private val context: Context, private val sto
     }
 
     private fun TaskItem.toMap(): Map<String, Any?> = mapOf(
-        "text" to text, "done" to done, "createdBy" to createdBy, "createdAt" to createdAt,
+        "text" to text, "done" to done, "createdBy" to createdBy, "createdById" to createdById, "createdAt" to createdAt,
+        "recurrenceDays" to recurrenceDays, "doneAt" to doneAt, "assignedTo" to assignedTo, "assignedToId" to assignedToId,
     )
 
     private fun DocumentSnapshot.toTaskItem(): TaskItem? {
         val text = getString("text") ?: return null
         return TaskItem(id = id, text = text, done = getBoolean("done") ?: false,
-            createdBy = getString("createdBy") ?: "", createdAt = getLong("createdAt") ?: 0L)
+            createdBy = getString("createdBy") ?: "", createdById = getString("createdById") ?: "",
+            createdAt = getLong("createdAt") ?: 0L, recurrenceDays = getLong("recurrenceDays")?.toInt(),
+            doneAt = getLong("doneAt"), assignedTo = getString("assignedTo") ?: "", assignedToId = getString("assignedToId") ?: "")
     }
 
     private fun NoteItem.toMap(): Map<String, Any?> = mapOf(
-        "text" to text, "author" to author, "createdAt" to createdAt,
+        "text" to text, "author" to author, "authorId" to authorId, "createdAt" to createdAt,
     )
 
     private fun DocumentSnapshot.toNoteItem(): NoteItem? {
         val text = getString("text") ?: return null
-        return NoteItem(id = id, text = text, author = getString("author") ?: "", createdAt = getLong("createdAt") ?: 0L)
+        return NoteItem(id = id, text = text, author = getString("author") ?: "", authorId = getString("authorId") ?: "",
+            createdAt = getLong("createdAt") ?: 0L)
+    }
+
+    private fun DocumentSnapshot.toMember(): Member? {
+        val name = getString("name") ?: return null
+        val photoMime = getString("photoMime")
+        if (photoMime != null) getString("photoData")?.let { store.materializeFromBase64("member-photos", id, photoMime, it) }
+        return Member(id = id, name = name, photoMime = photoMime,
+            lat = getDouble("lat"), lng = getDouble("lng"), locationUpdatedAt = getLong("locationUpdatedAt"))
     }
 }
 

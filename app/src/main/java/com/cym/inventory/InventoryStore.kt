@@ -29,6 +29,8 @@ internal data class InventoryItem(
     val description: String = "",
     val location: String = "",
     val purpose: String = "",
+    val paidBy: String = "",
+    val paidById: String = "",
     val updatedAt: Long = System.currentTimeMillis(),
 )
 
@@ -127,11 +129,14 @@ internal class InventoryStore(private val context: Context) {
 
     private fun mediaFile(subdir: String, id: String, mime: String): File = File(context.filesDir, "$subdir/$id.${extensionFor(mime)}")
 
+    /** Appends the file's last-modified time so Compose sees a new Uri (and reloads the thumbnail) whenever a photo at this same path is replaced. */
     private fun toFileProviderUri(file: File): Uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+        .buildUpon().appendQueryParameter("t", file.lastModified().toString()).build()
 
     fun photoUri(item: InventoryItem): Uri? = item.photoMime?.let { mediaFile("photos", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
     fun receiptUri(item: InventoryItem): Uri? = item.receiptMime?.let { mediaFile("receipts", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
     fun wishlistPhotoUri(item: WishlistItem): Uri? = item.photoMime?.let { mediaFile("wishlist-photos", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
+    fun memberPhotoUri(member: Member): Uri? = member.photoMime?.let { mediaFile("member-photos", member.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
     fun receiptMimeType(item: InventoryItem): String = item.receiptMime ?: "image/jpeg"
 
     /** Copies a picked content Uri into the local cache at a deterministic path and returns its MIME type. */
