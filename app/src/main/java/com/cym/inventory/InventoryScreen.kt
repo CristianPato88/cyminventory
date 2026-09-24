@@ -23,6 +23,7 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -76,6 +77,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -158,6 +161,7 @@ private enum class Tab(val title: String, val icon: Int) {
     HOME("En casa", R.drawable.ic_home),
     WISHLIST("Deseados", R.drawable.ic_wishlist),
     SHARED("Compartido", R.drawable.ic_shared),
+    LOCATION("Dónde estamos", R.drawable.ic_map_pin),
     EXPENSES("Gastos", R.drawable.ic_expenses),
 }
 
@@ -319,6 +323,7 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
     var sheetOpen by remember { mutableStateOf(false) }
     var wishlistSheetItem by remember { mutableStateOf<WishlistItem?>(null) }
     var wishlistSheetOpen by remember { mutableStateOf(false) }
+    var mediaViewerUri by remember { mutableStateOf<Uri?>(null) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     LaunchedEffect(householdId) {
@@ -377,6 +382,10 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
             receiptError = "El ticket aún no se ha sincronizado en este móvil. Prueba de nuevo en un momento."
             return
         }
+        if (store.receiptMimeType(item).startsWith("image/")) {
+            mediaViewerUri = uri
+            return
+        }
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, store.receiptMimeType(item))
@@ -385,6 +394,15 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
         } catch (_: ActivityNotFoundException) {
             receiptError = "Instala una app que pueda abrir este ticket."
         }
+    }
+
+    fun openPhoto(item: InventoryItem) {
+        val uri = store.photoUri(item)
+        if (uri == null) {
+            receiptError = "La foto aún no se ha sincronizado en este móvil. Prueba de nuevo en un momento."
+            return
+        }
+        mediaViewerUri = uri
     }
 
     fun exportInventory() {
@@ -411,11 +429,12 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
                     onSeeAllHome = { tab = Tab.HOME })
                 Tab.HOME -> HomeScreen(items.filter { it.status == ItemStatus.PURCHASED }, store,
                     onAddPurchase = { openSheet(null, true) }, onEdit = { openSheet(it, true) },
-                    onReceipt = ::openReceipt, onExport = ::exportInventory)
+                    onReceipt = ::openReceipt, onPhoto = ::openPhoto, onExport = ::exportInventory)
                 Tab.WISHLIST -> WishlistScreen(wishlist, store,
                     onAdd = { openWishlistSheet(null) }, onEdit = { openWishlistSheet(it) },
                     onDelete = ::deleteWishlistItem, onMoveToPending = ::moveWishlistToPending)
                 Tab.SHARED -> SharedScreen(store, repo, householdId)
+                Tab.LOCATION -> WhereScreen(store, repo, householdId)
                 Tab.EXPENSES -> ExpenseScreen(items.filter { it.status == ItemStatus.PURCHASED })
             }
             Box(Modifier.align(Alignment.TopEnd).padding(top = 20.dp, end = 20.dp).size(38.dp)
@@ -428,6 +447,7 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
         }
         BottomBar(tab, onTab = { tab = it })
     }
+    mediaViewerUri?.let { uri -> FullScreenImageViewer(uri, onDismiss = { mediaViewerUri = null }) }
     if (receiptError.isNotBlank()) {
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { receiptError = "" },
@@ -661,7 +681,7 @@ private data class HomeFilters(
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 private fun HomeScreen(items: List<InventoryItem>, store: InventoryStore, onAddPurchase: () -> Unit,
-    onEdit: (InventoryItem) -> Unit, onReceipt: (InventoryItem) -> Unit, onExport: () -> Unit) {
+    onEdit: (InventoryItem) -> Unit, onReceipt: (InventoryItem) -> Unit, onPhoto: (InventoryItem) -> Unit, onExport: () -> Unit) {
     val colors = LocalPalette.current
     var query by remember { mutableStateOf("") }
     var filters by remember { mutableStateOf(HomeFilters()) }
@@ -742,7 +762,7 @@ private fun HomeScreen(items: List<InventoryItem>, store: InventoryStore, onAddP
             }
         } else {
             items(filtered, key = { it.id }) { item ->
-                HomeItemCard(item, store, onEdit = { onEdit(item) }, onReceipt = { onReceipt(item) })
+                HomeItemCard(item, store, onEdit = { onEdit(item) }, onReceipt = { onReceipt(item) }, onPhoto = { onPhoto(item) })
             }
         }
         item {
@@ -817,7 +837,7 @@ private fun DetailRow(label: String, value: String, modifier: Modifier = Modifie
 }
 
 @Composable
-private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () -> Unit, onReceipt: () -> Unit) {
+private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () -> Unit, onReceipt: () -> Unit, onPhoto: () -> Unit) {
     val colors = LocalPalette.current
     var expanded by remember(item.id) { mutableStateOf(false) }
     val rotation by androidx.compose.animation.core.animateFloatAsState(if (expanded) 180f else 0f, label = "chevron")
@@ -826,7 +846,8 @@ private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () 
         Column(Modifier.animateContentSize().clickable { expanded = !expanded }.padding(15.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
                 PhotoAvatar(item.name, store.photoUri(item),
-                    Modifier.size(50.dp).clip(RoundedCornerShape(13.dp)).background(colors.mint), colors.pineLight, 22.sp)
+                    Modifier.size(50.dp).clip(RoundedCornerShape(13.dp)).background(colors.mint)
+                        .let { if (item.photoMime != null) it.clickable(onClick = onPhoto) else it }, colors.pineLight, 22.sp)
                 Column(Modifier.weight(1f)) {
                     Text(listOf(item.category, item.room).filter(String::isNotBlank).joinToString(" · ").ifBlank { "SIN CATEGORÍA" }.uppercase(),
                         color = colors.pineLight, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 9.sp,
@@ -890,16 +911,7 @@ private fun HomeItemCard(item: InventoryItem, store: InventoryStore, onEdit: () 
 @Composable
 private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, householdId: String) {
     val colors = LocalPalette.current
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var hasLocationPermission by remember { mutableStateOf(LocationUtil.hasPermission(context)) }
-    val backgroundLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    val fineLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
-        hasLocationPermission = results.values.any { it }
-        if (hasLocationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            backgroundLocationLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-        }
-    }
     val tasksFlow = remember(householdId) { repo.tasksFlow(householdId) }
     val notesFlow = remember(householdId) { repo.notesFlow(householdId) }
     val membersFlow = remember(householdId) { repo.membersFlow(householdId) }
@@ -909,9 +921,8 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
     val membersById = remember(members) { members.associateBy { it.id } }
     var taskInput by remember { mutableStateOf("") }
     var noteInput by remember { mutableStateOf("") }
-    var section by remember { mutableStateOf(0) }
+    var showNotes by remember { mutableStateOf(false) }
     var editingProfile by remember { mutableStateOf(false) }
-    var locationStatus by remember { mutableStateOf("") }
     var taskRecurrence by remember { mutableStateOf<Int?>(null) }
     var taskAssignee by remember { mutableStateOf<Member?>(null) }
     val author = repo.memberName.ifBlank { "Alguien de casa" }
@@ -924,7 +935,8 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
             .forEach { due -> runCatching { repo.setTaskDone(householdId, due.id, false) } }
     }
 
-    val header: @Composable () -> Unit = {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
             BrandHeader()
             Spacer(Modifier.height(30.dp))
             PageLabel("Compartido")
@@ -946,18 +958,18 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
             Spacer(Modifier.height(18.dp))
             Row(Modifier.fillMaxWidth().background(colors.paper, RoundedCornerShape(14.dp)).padding(4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                listOf("Tareas" to 0, "Notas" to 1, "Dónde estoy" to 2).forEach { (label, index) ->
-                    val selected = section == index
+                listOf("Tareas" to false, "Notas" to true).forEach { (label, value) ->
+                    val selected = showNotes == value
                     Box(Modifier.weight(1f).clip(RoundedCornerShape(11.dp))
                         .background(if (selected) colors.pine else Color.Transparent)
-                        .clickable { section = index }.padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+                        .clickable { showNotes = value }.padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
                         Text(label, color = if (selected) colors.onPine else colors.muted, fontFamily = Manrope,
                             fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     }
                 }
             }
             Spacer(Modifier.height(18.dp))
-            if (section == 0) {
+            if (!showNotes) {
                 Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(null to "No repetir", 1 to "↻ Diaria", 7 to "↻ Semanal", 30 to "↻ Mensual").forEach { (days, label) ->
                         val selected = taskRecurrence == days
@@ -984,85 +996,55 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
                     Spacer(Modifier.height(8.dp))
                 }
             }
-            if (section != 2) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Box(Modifier.weight(1f).heightIn(min = 48.dp).background(colors.paper, RoundedCornerShape(14.dp))
-                        .padding(horizontal = 15.dp, vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
-                        BasicTextField(if (section == 0) taskInput else noteInput,
-                            onValueChange = { if (section == 0) taskInput = it else noteInput = it }, singleLine = section == 0,
-                            textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
-                            modifier = Modifier.fillMaxWidth(),
-                            decorationBox = { inner ->
-                                if ((if (section == 0) taskInput else noteInput).isEmpty())
-                                    Text(if (section == 0) "Añadir una tarea" else "Escribir una nota",
-                                        color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
-                                inner()
-                            })
-                    }
-                    Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(colors.pine)
-                        .clickable {
-                            val text = (if (section == 0) taskInput else noteInput).trim()
-                            if (text.isBlank()) return@clickable
-                            scope.launch {
-                                runCatching {
-                                    if (section == 0) repo.addTask(householdId, text, author, taskRecurrence,
-                                        taskAssignee?.name ?: "", taskAssignee?.id ?: "")
-                                    else repo.addNote(householdId, text, author)
-                                }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(Modifier.weight(1f).heightIn(min = 48.dp).background(colors.paper, RoundedCornerShape(14.dp))
+                    .padding(horizontal = 15.dp, vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                    BasicTextField(if (!showNotes) taskInput else noteInput,
+                        onValueChange = { if (!showNotes) taskInput = it else noteInput = it }, singleLine = !showNotes,
+                        textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
+                        modifier = Modifier.fillMaxWidth(),
+                        decorationBox = { inner ->
+                            if ((if (!showNotes) taskInput else noteInput).isEmpty())
+                                Text(if (!showNotes) "Añadir una tarea" else "Escribir una nota",
+                                    color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
+                            inner()
+                        })
+                }
+                Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(colors.pine)
+                    .clickable {
+                        val text = (if (!showNotes) taskInput else noteInput).trim()
+                        if (text.isBlank()) return@clickable
+                        scope.launch {
+                            runCatching {
+                                if (!showNotes) repo.addTask(householdId, text, author, taskRecurrence,
+                                    taskAssignee?.name ?: "", taskAssignee?.id ?: "")
+                                else repo.addNote(householdId, text, author)
                             }
-                            if (section == 0) { taskInput = ""; taskRecurrence = null; taskAssignee = null } else noteInput = ""
-                        }, contentAlignment = Alignment.Center) {
-                        Text("＋", color = colors.onPine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                    }
-                }
-                Spacer(Modifier.height(6.dp))
-            }
-    }
-
-    if (section == 2) {
-        // The map handles its own pan/zoom gestures; it must NOT sit inside a scrollable
-        // ancestor (a LazyColumn here would fight the map for drag/pinch gestures and the
-        // whole screen would scroll instead of the map panning).
-        Column(Modifier.fillMaxSize().padding(22.dp)) {
-            header()
-            LocationScreen(members, repo.memberId, hasLocationPermission, locationStatus,
-                modifier = Modifier.weight(1f), store = store,
-                onRequestPermission = { fineLocationLauncher.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) },
-                onShareNow = {
-                    locationStatus = "Buscando tu ubicación…"
-                    scope.launch {
-                        val location = LocationUtil.getCurrentLocation(context)
-                        if (location == null) {
-                            locationStatus = "No se pudo obtener tu ubicación. Comprueba que la ubicación esté activada en el sistema e inténtalo de nuevo."
-                            return@launch
                         }
-                        runCatching { repo.updateMemberLocation(householdId, location.latitude, location.longitude) }
-                            .onSuccess { locationStatus = "Ubicación compartida." }
-                            .onFailure { locationStatus = "No se pudo guardar tu ubicación. Comprueba tu conexión." }
-                    }
-                })
-        }
-    } else {
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item { header() }
-            if (section == 0) {
-                if (tasks.isEmpty()) {
-                    item { EmptySharedState("Sin tareas por ahora", "Añadid lo primero que se os ocurra para la casa.") }
-                } else {
-                    items(tasks, key = { "task-" + it.id }) { task ->
-                        TaskRow(task, membersById[task.createdById]?.let(store::memberPhotoUri),
-                            onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
-                            onDelete = { scope.launch { runCatching { repo.deleteTask(householdId, task.id) } } })
-                    }
+                        if (!showNotes) { taskInput = ""; taskRecurrence = null; taskAssignee = null } else noteInput = ""
+                    }, contentAlignment = Alignment.Center) {
+                    Text("＋", color = colors.onPine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 20.sp)
                 }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+        if (!showNotes) {
+            if (tasks.isEmpty()) {
+                item { EmptySharedState("Sin tareas por ahora", "Añadid lo primero que se os ocurra para la casa.") }
             } else {
-                if (notes.isEmpty()) {
-                    item { EmptySharedState("Sin notas todavía", "Dejad aquí lo que queráis recordar entre los dos.") }
-                } else {
-                    items(notes, key = { "note-" + it.id }) { note ->
-                        NoteRow(note, membersById[note.authorId]?.let(store::memberPhotoUri),
-                            onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
-                    }
+                items(tasks, key = { "task-" + it.id }) { task ->
+                    TaskRow(task, membersById[task.createdById]?.let(store::memberPhotoUri),
+                        onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
+                        onDelete = { scope.launch { runCatching { repo.deleteTask(householdId, task.id) } } })
+                }
+            }
+        } else {
+            if (notes.isEmpty()) {
+                item { EmptySharedState("Sin notas todavía", "Dejad aquí lo que queráis recordar entre los dos.") }
+            } else {
+                items(notes, key = { "note-" + it.id }) { note ->
+                    NoteRow(note, membersById[note.authorId]?.let(store::memberPhotoUri),
+                        onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
                 }
             }
         }
@@ -1075,6 +1057,41 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
                 scope.launch { runCatching { repo.saveMemberProfile(householdId, newName, newPhoto) } }
             })
     }
+}
+
+/** Full-bleed, Life360-style map: its own tab so the map is the whole screen, not a strip under a header. */
+@Composable
+private fun WhereScreen(store: InventoryStore, repo: HouseholdRepository, householdId: String) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var hasLocationPermission by remember { mutableStateOf(LocationUtil.hasPermission(context)) }
+    val backgroundLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    val fineLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        hasLocationPermission = results.values.any { it }
+        if (hasLocationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            backgroundLocationLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        }
+    }
+    val membersFlow = remember(householdId) { repo.membersFlow(householdId) }
+    val members by membersFlow.collectAsState(initial = emptyList())
+    var locationStatus by remember { mutableStateOf("") }
+
+    LocationScreen(members, repo.memberId, hasLocationPermission, locationStatus,
+        modifier = Modifier.fillMaxSize(), store = store,
+        onRequestPermission = { fineLocationLauncher.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) },
+        onShareNow = {
+            locationStatus = "Buscando tu ubicación…"
+            scope.launch {
+                val location = LocationUtil.getCurrentLocation(context)
+                if (location == null) {
+                    locationStatus = "No se pudo obtener tu ubicación. Comprueba que la ubicación esté activada en el sistema e inténtalo de nuevo."
+                    return@launch
+                }
+                runCatching { repo.updateMemberLocation(householdId, location.latitude, location.longitude) }
+                    .onSuccess { locationStatus = "Ubicación compartida." }
+                    .onFailure { locationStatus = "No se pudo guardar tu ubicación. Comprueba tu conexión." }
+            }
+        })
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1100,24 +1117,20 @@ private fun ProfileSheet(initialName: String, initialPhoto: Uri?,
     }
 }
 
-/** CARTO's free basemap tiles (no API key): a soft, uncluttered style closer to Life360 than raw OSM Mapnik. */
-private val CartoVoyagerTileSource = org.osmdroid.tileprovider.tilesource.XYTileSource(
-    "CartoVoyager", 0, 19, 512, "@2x.png",
-    arrayOf(
-        "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
-        "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
-        "https://c.basemaps.cartocdn.com/rastertiles/voyager/",
-        "https://d.basemaps.cartocdn.com/rastertiles/voyager/",
-    ),
-)
-private val CartoDarkTileSource = org.osmdroid.tileprovider.tilesource.XYTileSource(
-    "CartoDarkMatter", 0, 19, 512, "@2x.png",
-    arrayOf(
-        "https://a.basemaps.cartocdn.com/rastertiles/dark_all/",
-        "https://b.basemaps.cartocdn.com/rastertiles/dark_all/",
-        "https://c.basemaps.cartocdn.com/rastertiles/dark_all/",
-        "https://d.basemaps.cartocdn.com/rastertiles/dark_all/",
-    ),
+// Both CARTO's raster basemaps ("API key required" watermark) and osmdroid's bundled Wikimedia
+// source (403 "restricted to Wikimedia and affiliated sites") turned out to be locked down despite
+// looking like free public CDNs. Standard OpenStreetMap tiles are the one basemap with a usage policy
+// explicitly written for exactly this: a small app with a real User-Agent and light traffic (see
+// operations.osmfoundation.org/policies/tiles) — and it's osmdroid's own documented default source.
+// Dark mode reuses it with a color-invert filter instead of gambling on yet another "free" dark CDN.
+private val MapTileSource = org.osmdroid.tileprovider.tilesource.TileSourceFactory.MAPNIK
+private val DarkMapColorFilter = android.graphics.ColorMatrixColorFilter(
+    android.graphics.ColorMatrix(floatArrayOf(
+        -1f, 0f, 0f, 0f, 255f,
+        0f, -1f, 0f, 0f, 255f,
+        0f, 0f, -1f, 0f, 255f,
+        0f, 0f, 0f, 1f, 0f,
+    )),
 )
 
 /** Draws a Life360-style avatar pin: a circular photo (or initial) bubble in the member's color, with a pointer tail. */
@@ -1194,100 +1207,145 @@ private fun LocationScreen(members: List<Member>, ownMemberId: String, hasLocati
     val located = members.filter { it.lat != null && it.lng != null }
     val ringPalette = remember(colors) { listOf(colors.pine, colors.danger, colors.peach, colors.pineLight, colors.sand) }
 
-    Column(modifier.fillMaxWidth()) {
-        if (!hasLocationPermission) {
-            Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Activa la ubicación", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text("Para ver dónde está cada uno hace falta el permiso de ubicación. Se comparte de forma aproximada cada 15 minutos, incluso con la app cerrada.",
-                        color = colors.muted, fontFamily = Manrope, fontSize = 12.sp, lineHeight = 17.sp)
-                    Button(onClick = onRequestPermission, colors = ButtonDefaults.buttonColors(containerColor = colors.pine)) {
-                        Text("Activar ubicación", fontFamily = Manrope, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-        } else {
-            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.paper)
-                .clickable(onClick = onShareNow).padding(14.dp), horizontalArrangement = Arrangement.Center) {
-                Text("Compartir mi ubicación ahora", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-            }
-            if (statusMessage.isNotBlank()) {
-                Spacer(Modifier.height(8.dp))
-                Text(statusMessage, color = colors.muted, fontFamily = Manrope, fontSize = 11.sp, lineHeight = 15.sp)
-            }
-            Spacer(Modifier.height(12.dp))
-        }
+    Box(modifier.fillMaxSize().background(colors.cream)) {
         if (located.isEmpty()) {
-            EmptySharedState("Sin ubicaciones todavía", "En cuanto alguien comparta su ubicación, aparecerá aquí en el mapa.")
+            // Nothing to show a map of yet: same content, but as a plain (non-floating) column.
+            Column(Modifier.fillMaxSize().padding(22.dp)) {
+                PageLabel("Dónde estamos")
+                Spacer(Modifier.height(10.dp))
+                Text("Toda la familia.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 32.sp)
+                Spacer(Modifier.height(16.dp))
+                LocationPermissionOrShareCard(hasLocationPermission, statusMessage, onRequestPermission, onShareNow)
+                Spacer(Modifier.height(16.dp))
+                EmptySharedState("Sin ubicaciones todavía", "En cuanto alguien comparta su ubicación, aparecerá aquí en el mapa.")
+            }
         } else {
             val target = located.firstOrNull { it.id == ownMemberId } ?: located.first()
             val mapViewRef = remember { mutableStateOf<org.osmdroid.views.MapView?>(null) }
             val markerIcons = remember { mutableMapOf<String, BitmapDrawable>() }
 
-            Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(16.dp))) {
-                androidx.compose.ui.viewinterop.AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { ctx ->
-                        org.osmdroid.views.MapView(ctx).apply {
-                            setMultiTouchControls(true)
-                            setTileSource(if (isDark) CartoDarkTileSource else CartoVoyagerTileSource)
-                            isTilesScaledToDpi = true
-                            minZoomLevel = 3.0
-                            maxZoomLevel = 19.0
-                            overlays.add(org.osmdroid.views.overlay.CopyrightOverlay(ctx))
-                            controller.setZoom(15.0)
-                            // Center once, here at creation, and never again: doing this in `update` would
-                            // snap the camera back and undo the user's own pan/zoom every time a location syncs.
-                            controller.setCenter(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
-                            mapViewRef.value = this
+            // Full-bleed map: everything else (top bar, share pill, people sheet) floats on top of it,
+            // Life360-style, instead of pushing it down into a strip under a header.
+            androidx.compose.ui.viewinterop.AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    org.osmdroid.views.MapView(ctx).apply {
+                        setMultiTouchControls(true)
+                        setTileSource(MapTileSource)
+                        if (isDark) overlayManager.tilesOverlay.setColorFilter(DarkMapColorFilter)
+                        isTilesScaledToDpi = true
+                        minZoomLevel = 3.0
+                        maxZoomLevel = 19.0
+                        overlays.add(org.osmdroid.views.overlay.CopyrightOverlay(ctx))
+                        controller.setZoom(15.0)
+                        // Center once, here at creation, and never again: doing this in `update` would
+                        // snap the camera back and undo the user's own pan/zoom every time a location syncs.
+                        controller.setCenter(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
+                        mapViewRef.value = this
+                    }
+                },
+                update = { mapView ->
+                    mapView.overlays.removeAll { it is org.osmdroid.views.overlay.Marker }
+                    located.forEach { member ->
+                        val photoUri = store.memberPhotoUri(member)
+                        val markerIcon = markerIcons.getOrPut("${member.id}|$photoUri|$isDark") {
+                            buildAvatarMarkerIcon(context, photoUri, member.name, ringPalette[(member.id.hashCode() and Int.MAX_VALUE) % ringPalette.size].toArgb())
                         }
-                    },
-                    update = { mapView ->
-                        mapView.overlays.removeAll { it is org.osmdroid.views.overlay.Marker }
-                        located.forEach { member ->
-                            val photoUri = store.memberPhotoUri(member)
-                            val markerIcon = markerIcons.getOrPut("${member.id}|$photoUri|$isDark") {
-                                buildAvatarMarkerIcon(context, photoUri, member.name, ringPalette[(member.id.hashCode() and Int.MAX_VALUE) % ringPalette.size].toArgb())
-                            }
-                            mapView.overlays.add(org.osmdroid.views.overlay.Marker(mapView).apply {
-                                position = org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!)
-                                title = member.name
-                                icon = markerIcon
-                                setAnchor(0.5f, 1f)
-                            })
-                        }
-                        mapView.invalidate()
-                    },
-                    onRelease = { mapView -> mapView.onDetach() },
-                )
-                Box(Modifier.align(Alignment.BottomEnd).padding(14.dp).size(44.dp).clip(CircleShape)
-                    .background(colors.paper).clickable {
+                        mapView.overlays.add(org.osmdroid.views.overlay.Marker(mapView).apply {
+                            position = org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!)
+                            title = member.name
+                            icon = markerIcon
+                            setAnchor(0.5f, 1f)
+                        })
+                    }
+                    mapView.invalidate()
+                },
+                onRelease = { mapView -> mapView.onDetach() },
+            )
+
+            Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(16.dp)) {
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.paper.copy(alpha = 0.95f))
+                    .padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Image(painter = painterResource(R.drawable.cym_icon), contentDescription = null,
+                        modifier = Modifier.size(22.dp).clip(RoundedCornerShape(7.dp)))
+                    Spacer(Modifier.width(10.dp))
+                    Text("Dónde estamos", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                        modifier = Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(10.dp))
+                LocationPermissionOrShareCard(hasLocationPermission, statusMessage, onRequestPermission, onShareNow, floating = true)
+            }
+
+            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+                Box(Modifier.fillMaxWidth().padding(end = 16.dp, bottom = 12.dp), contentAlignment = Alignment.CenterEnd) {
+                    Box(Modifier.size(46.dp).clip(CircleShape).background(colors.paper).clickable {
                         mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
                         mapViewRef.value?.controller?.setZoom(15.0)
                     }, contentAlignment = Alignment.Center) {
-                    Icon(painterResource(R.drawable.ic_map_pin), contentDescription = "Centrar en mí", tint = colors.pine, modifier = Modifier.size(20.dp))
+                        Icon(painterResource(R.drawable.ic_map_pin), contentDescription = "Centrar en mí", tint = colors.pine, modifier = Modifier.size(20.dp))
+                    }
                 }
-            }
-            Spacer(Modifier.height(12.dp))
-            androidx.compose.foundation.lazy.LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(members, key = { it.id }) { member ->
-                    val isStale = member.locationUpdatedAt == null
-                    Row(Modifier.clip(RoundedCornerShape(14.dp)).background(colors.paper)
-                        .clickable(enabled = !isStale) {
-                            mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!))
-                        }.padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Box(Modifier.size(28.dp).clip(CircleShape).background(colors.mint)) {
-                            PhotoAvatar(member.name, store.memberPhotoUri(member), Modifier.fillMaxSize(), colors.pineLight, 12.sp)
-                        }
-                        Column {
-                            Text(member.name, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text(
-                                if (member.locationUpdatedAt != null) "Actualizado ${timeAgo(member.locationUpdatedAt)}" else "Sin compartir aún",
-                                color = colors.muted, fontFamily = Manrope, fontSize = 10.sp,
-                            )
+                Column(Modifier.fillMaxWidth().background(colors.paper, RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
+                    .padding(top = 10.dp, start = 18.dp, end = 18.dp, bottom = 18.dp)) {
+                    Box(Modifier.align(Alignment.CenterHorizontally).width(36.dp).height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)).background(colors.line))
+                    Spacer(Modifier.height(14.dp))
+                    Text("GENTE", color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp, letterSpacing = 1.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Column(Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState())) {
+                        members.forEach { member ->
+                            val isStale = member.lat == null || member.lng == null
+                            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                                .clickable(enabled = !isStale) {
+                                    mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!))
+                                }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Box(Modifier.size(36.dp).clip(CircleShape).background(colors.mint)) {
+                                    PhotoAvatar(member.name, store.memberPhotoUri(member), Modifier.fillMaxSize(), colors.pineLight, 14.sp)
+                                }
+                                Column(Modifier.weight(1f)) {
+                                    Text(member.name, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    Text(
+                                        if (member.locationUpdatedAt != null) "Actualizado ${timeAgo(member.locationUpdatedAt)}" else "Sin compartir aún",
+                                        color = colors.muted, fontFamily = Manrope, fontSize = 11.sp,
+                                    )
+                                }
+                            }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LocationPermissionOrShareCard(hasLocationPermission: Boolean, statusMessage: String,
+    onRequestPermission: () -> Unit, onShareNow: () -> Unit, floating: Boolean = false) {
+    val colors = LocalPalette.current
+    val bg = if (floating) colors.paper.copy(alpha = 0.95f) else colors.paper
+    if (!hasLocationPermission) {
+        Surface(color = bg, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Activa la ubicación", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text("Para ver dónde está cada uno hace falta el permiso de ubicación. Se comparte de forma aproximada cada 15 minutos, incluso con la app cerrada.",
+                    color = colors.muted, fontFamily = Manrope, fontSize = 12.sp, lineHeight = 17.sp)
+                Button(onClick = onRequestPermission, colors = ButtonDefaults.buttonColors(containerColor = colors.pine)) {
+                    Text("Activar ubicación", fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    } else {
+        Column {
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(bg)
+                .clickable(onClick = onShareNow).padding(14.dp), horizontalArrangement = Arrangement.Center) {
+                Text("Compartir mi ubicación ahora", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            }
+            if (statusMessage.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Surface(color = bg, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Text(statusMessage, color = colors.muted, fontFamily = Manrope, fontSize = 11.sp, lineHeight = 15.sp,
+                        modifier = Modifier.padding(12.dp))
                 }
             }
         }
@@ -1463,7 +1521,8 @@ private fun BottomBar(selected: Tab, onTab: (Tab) -> Unit) {
                         tint = if (selected == tab) colors.pine else colors.muted, modifier = Modifier.size(21.dp))
                 }
                 Text(tab.title, color = if (selected == tab) colors.pine else colors.muted, fontFamily = Manrope,
-                    fontWeight = FontWeight.Bold, fontSize = 9.sp, maxLines = 1)
+                    fontWeight = FontWeight.Bold, fontSize = 8.5.sp, lineHeight = 10.sp, maxLines = 2,
+                    overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
             }
         }
     }
@@ -1558,19 +1617,48 @@ private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryS
 }
 
 @Composable
-private fun rememberThumbnail(uri: Uri?): ImageBitmap? {
+private fun rememberThumbnail(uri: Uri?, sample: Int = 4): ImageBitmap? {
     val context = LocalContext.current
-    val state = produceState<ImageBitmap?>(initialValue = null, uri) {
+    val state = produceState<ImageBitmap?>(initialValue = null, uri, sample) {
         value = if (uri == null) null else withContext(Dispatchers.IO) {
             runCatching {
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    val options = BitmapFactory.Options().apply { inSampleSize = 4 }
+                    val options = BitmapFactory.Options().apply { inSampleSize = sample }
                     BitmapFactory.decodeStream(input, null, options)
                 }?.asImageBitmap()
             }.getOrNull()
         }
     }
     return state.value
+}
+
+/** Full-screen, pinch-to-zoom viewer for an item's photo or ticket, dismissed by the X or tapping the backdrop. */
+@Composable
+private fun FullScreenImageViewer(uri: Uri, onDismiss: () -> Unit) {
+    val bitmap = rememberThumbnail(uri, sample = 2)
+    var scale by remember(uri) { mutableStateOf(1f) }
+    var offset by remember(uri) { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.95f))
+            .clickable(indication = null, interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, onClick = onDismiss)) {
+            if (bitmap != null) {
+                Image(bitmap = bitmap, contentDescription = null, contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize()
+                        .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y)
+                        .pointerInput(uri) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                scale = (scale * zoom).coerceIn(1f, 6f)
+                                offset += pan
+                            }
+                        })
+            }
+            Box(Modifier.align(Alignment.TopEnd).padding(20.dp).size(38.dp).clip(CircleShape)
+                .background(Color.White.copy(alpha = 0.15f)).clickable(onClick = onDismiss), contentAlignment = Alignment.Center) {
+                Text("✕", color = Color.White, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            }
+        }
+    }
 }
 
 @Composable
@@ -1852,7 +1940,7 @@ private fun HomePreview() {
             purpose = "Apoyar cosas y decorar", description = "Mesa redonda de madera clara.", receiptMime = "image/jpeg"),
         InventoryItem(name = "Lámpara de pie", room = "Dormitorio", category = "Iluminación", status = ItemStatus.PURCHASED,
             priceCents = 3200, purchaseDate = "2026-09-05", shop = "Leroy Merlin"),
-    ), store, onAddPurchase = {}, onEdit = {}, onReceipt = {}, onExport = {})
+    ), store, onAddPurchase = {}, onEdit = {}, onReceipt = {}, onPhoto = {}, onExport = {})
 }
 
 @Preview(showBackground = true, widthDp = 420, heightDp = 900)
