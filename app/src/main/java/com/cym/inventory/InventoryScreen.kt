@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -1430,6 +1431,51 @@ private fun NoteRow(note: NoteItem, authorPhoto: Uri?, onDelete: () -> Unit) {
     }
 }
 
+// Validated categorical chart palette (dataviz skill's default ramp) — the app's own earthy accent
+// colors are too desaturated/close together to pass as chart-series colors, so charts borrow this
+// instead, while every other chart element (card, labels, chrome) stays in the app's own palette.
+private val ChartSeriesLight = listOf(0xFF2A78D6, 0xFFEB6834, 0xFF1BAF7A, 0xFFEDA100, 0xFFE87BA4).map { Color(it) }
+private val ChartSeriesDark = listOf(0xFF3987E5, 0xFFD95926, 0xFF199E70, 0xFFC98500, 0xFFD55181).map { Color(it) }
+
+/** Ranked horizontal-bar breakdown of spend by an item field (category, room, ...); hidden when there's
+ * only one group (a one-bar chart isn't a chart — the hero total above already says that number). */
+@Composable
+private fun SpendBreakdownChart(title: String, items: List<InventoryItem>, groupKey: (InventoryItem) -> String) {
+    val colors = LocalPalette.current
+    val palette = if (colors === DarkPalette) ChartSeriesDark else ChartSeriesLight
+    val grouped = items.groupBy { groupKey(it).ifBlank { "Sin especificar" } }
+        .mapValues { (_, list) -> list.sumOf { it.priceCents ?: 0L } }
+        .filterValues { it > 0 }
+    if (grouped.size < 2) return
+    val sorted = grouped.entries.sortedByDescending { it.value }.map { it.key to it.value }
+    val rest = sorted.drop(5).sumOf { it.second }
+    val rows = if (rest > 0) sorted.take(5) + ("Otros" to rest) else sorted
+    val maxValue = rows.maxOf { it.second }.coerceAtLeast(1)
+
+    Spacer(Modifier.height(18.dp))
+    Text(title.uppercase(), color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp, letterSpacing = 1.sp)
+    Spacer(Modifier.height(10.dp))
+    Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(vertical = 6.dp, horizontal = 16.dp)) {
+            rows.forEachIndexed { index, (label, value) ->
+                val barColor = if (label == "Otros") colors.muted else palette[index % palette.size]
+                Row(Modifier.fillMaxWidth().padding(vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(label, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 11.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.width(78.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Box(Modifier.weight(1f).height(18.dp)) {
+                        Box(Modifier.fillMaxHeight().fillMaxWidth((value.toFloat() / maxValue).coerceIn(0.04f, 1f))
+                            .clip(RoundedCornerShape(topEnd = 5.dp, bottomEnd = 5.dp)).background(barColor))
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Text(formatMoney(value), color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp, maxLines = 1, modifier = Modifier.width(64.dp))
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun ExpenseScreen(items: List<InventoryItem>) {
     val colors = LocalPalette.current
@@ -1452,6 +1498,8 @@ private fun ExpenseScreen(items: List<InventoryItem>) {
                 Text("${items.size} compras registradas", color = colors.mint, fontFamily = Manrope, fontSize = 12.sp)
             }
         }
+        SpendBreakdownChart("Por categoría", items) { it.category }
+        SpendBreakdownChart("Por habitación", items) { it.room }
         Spacer(Modifier.height(18.dp))
         if (byPayer.isEmpty()) {
             Text("Cuando registréis quién paga cada compra, aquí veréis el reparto entre los dos.",

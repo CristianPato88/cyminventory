@@ -13,8 +13,8 @@ android {
         applicationId = "com.cym.inventory"
         minSdk = 30
         targetSdk = 37
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.1.3"
     }
 
     buildFeatures { compose = true }
