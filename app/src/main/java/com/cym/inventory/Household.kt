@@ -17,6 +17,9 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
+/** Thrown when a picked photo/receipt (or the combination of both) won't fit Firestore's per-document size limit. */
+internal class AttachmentTooLargeException(message: String) : Exception(message)
+
 internal data class TaskItem(
     val id: String = UUID.randomUUID().toString(),
     val text: String,
@@ -108,6 +111,7 @@ internal class HouseholdRepository(private val context: Context, private val sto
         if (pickedPhoto != null) {
             photoMime = store.cachePickedFile(pickedPhoto, "member-photos", id)
             photoBase64 = store.prepareUpload("member-photos", id, photoMime)
+                ?: throw AttachmentTooLargeException("La foto es demasiado grande. Prueba con otra imagen.")
         }
         val data = mutableMapOf<String, Any?>("name" to name)
         if (photoMime != null) data["photoMime"] = photoMime
@@ -154,11 +158,19 @@ internal class HouseholdRepository(private val context: Context, private val sto
             var receiptBase64: Any? = null
             if (pickedPhoto != null) {
                 photoMime = store.cachePickedFile(pickedPhoto, "photos", item.id)
-                photoBase64 = store.prepareUpload("photos", item.id, photoMime) ?: com.google.firebase.firestore.FieldValue.delete()
+                photoBase64 = store.prepareUpload("photos", item.id, photoMime, InventoryStore.PHOTO_MAX_BYTES)
+                    ?: throw AttachmentTooLargeException("La foto es demasiado grande. Prueba con otra imagen.")
             }
             if (pickedReceipt != null) {
                 receiptMime = store.cachePickedFile(pickedReceipt, "receipts", item.id)
-                receiptBase64 = store.prepareUpload("receipts", item.id, receiptMime) ?: com.google.firebase.firestore.FieldValue.delete()
+                receiptBase64 = store.prepareUpload("receipts", item.id, receiptMime, InventoryStore.RECEIPT_MAX_BYTES)
+                    ?: throw AttachmentTooLargeException(
+                        "El ticket es demasiado grande (máx. ~${InventoryStore.RECEIPT_MAX_BYTES / 1000} KB si es PDF). " +
+                            "Prueba a escanearlo con menor calidad o hazle una foto en vez de adjuntar el PDF.")
+            }
+            val combinedBase64Length = ((photoBase64 as? String)?.length ?: 0) + ((receiptBase64 as? String)?.length ?: 0)
+            if (combinedBase64Length > InventoryStore.FIRESTORE_ATTACHMENTS_BUDGET) {
+                throw AttachmentTooLargeException("La foto y el ticket juntos son demasiado grandes. Reduce el tamaño de uno de los dos.")
             }
             val data = item.copy(photoMime = photoMime, receiptMime = receiptMime,
                 updatedAt = System.currentTimeMillis()).toMap().toMutableMap()
@@ -186,7 +198,8 @@ internal class HouseholdRepository(private val context: Context, private val sto
             var photoBase64: Any? = null
             if (pickedPhoto != null) {
                 photoMime = store.cachePickedFile(pickedPhoto, "wishlist-photos", item.id)
-                photoBase64 = store.prepareUpload("wishlist-photos", item.id, photoMime) ?: com.google.firebase.firestore.FieldValue.delete()
+                photoBase64 = store.prepareUpload("wishlist-photos", item.id, photoMime)
+                    ?: throw AttachmentTooLargeException("La foto es demasiado grande. Prueba con otra imagen.")
             }
             val data = item.copy(photoMime = photoMime, updatedAt = System.currentTimeMillis()).toMap().toMutableMap()
             if (photoBase64 != null) data["photoData"] = photoBase64

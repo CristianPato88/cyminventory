@@ -10,6 +10,7 @@ import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.math.BigDecimal
+import java.nio.charset.Charset
 import java.time.LocalDate
 import java.util.UUID
 
@@ -164,12 +165,22 @@ internal class InventoryStore(private val context: Context) {
     }
 
     /** Compresses (images) or reads (PDFs) the cached file for upload; null if it can't fit the free Firestore document budget. */
-    fun prepareUpload(subdir: String, id: String, mime: String, maxBytes: Int = 650_000): String? {
+    fun prepareUpload(subdir: String, id: String, mime: String, maxBytes: Int = PHOTO_MAX_BYTES): String? {
         val file = mediaFile(subdir, id, mime)
         if (!file.exists()) return null
         val bytes = if (mime == "application/pdf") file.readBytes().takeIf { it.size <= maxBytes }
             else compressImage(file, maxBytes)
         return bytes?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+    }
+
+    companion object {
+        /** Firestore's hard per-document limit is 1,048,576 bytes; this leaves headroom for the item's other fields. */
+        const val FIRESTORE_ATTACHMENTS_BUDGET = 950_000
+
+        const val PHOTO_MAX_BYTES = 650_000
+
+        /** PDFs aren't compressible like photos, so they get a larger share of the budget (still safe alone: base64 ≈ 933 KB). */
+        const val RECEIPT_MAX_BYTES = 700_000
     }
 
     private fun compressImage(file: File, maxBytes: Int): ByteArray? {
@@ -215,10 +226,12 @@ internal class InventoryStore(private val context: Context) {
             )
         }
         val csv = buildString {
-            append(header.joinToString(";", postfix = "\n") { csvEscape(it) })
-            rows.forEach { row -> append(row.joinToString(";", postfix = "\n") { csvEscape(it) }) }
+            append(header.joinToString(";", postfix = "\r\n") { csvEscape(it) })
+            rows.forEach { row -> append(row.joinToString(";", postfix = "\r\n") { csvEscape(it) }) }
         }
-        file.writeText("﻿$csv")
+        // Excel Mobile (Android/iOS) doesn't reliably honor a UTF-8 BOM and mangles tildes/Ñ when it doesn't;
+        // Windows-1252 covers the full Spanish alphabet and is what Excel assumes for CSV without a BOM.
+        file.writeBytes(csv.toByteArray(Charset.forName("windows-1252")))
         return FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
     }
 

@@ -4,7 +4,17 @@ import android.app.DatePickerDialog
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
+import android.graphics.BlurMaskFilter
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -287,6 +297,11 @@ private fun HouseholdOnboardingScreen(repo: HouseholdRepository, onReady: (Strin
     }
 }
 
+private fun Throwable.toSaveErrorMessage(): String = when (this) {
+    is AttachmentTooLargeException -> message ?: "El archivo adjunto es demasiado grande."
+    else -> "No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo."
+}
+
 @Composable
 internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, householdId: String,
     darkTheme: Boolean, onToggleTheme: () -> Unit) {
@@ -324,7 +339,7 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
         else item
         scope.launch {
             runCatching { repo.saveItem(householdId, toSave, pickedPhoto, pickedReceipt) }
-                .onFailure { receiptError = "No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo." }
+                .onFailure { receiptError = it.toSaveErrorMessage() }
         }
     }
     fun deleteItem(item: InventoryItem) {
@@ -340,7 +355,7 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
         wishlistSheetOpen = false
         scope.launch {
             runCatching { repo.saveWishlistItem(householdId, item, pickedPhoto) }
-                .onFailure { receiptError = "No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo." }
+                .onFailure { receiptError = it.toSaveErrorMessage() }
         }
     }
     fun deleteWishlistItem(item: WishlistItem) {
@@ -909,8 +924,7 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
             .forEach { due -> runCatching { repo.setTaskDone(householdId, due.id, false) } }
     }
 
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item {
+    val header: @Composable () -> Unit = {
             BrandHeader()
             Spacer(Modifier.height(30.dp))
             PageLabel("Compartido")
@@ -1003,43 +1017,53 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
                 }
                 Spacer(Modifier.height(6.dp))
             }
-        }
-        if (section == 0) {
-            if (tasks.isEmpty()) {
-                item { EmptySharedState("Sin tareas por ahora", "Añadid lo primero que se os ocurra para la casa.") }
-            } else {
-                items(tasks, key = { "task-" + it.id }) { task ->
-                    TaskRow(task, membersById[task.createdById]?.let(store::memberPhotoUri),
-                        onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
-                        onDelete = { scope.launch { runCatching { repo.deleteTask(householdId, task.id) } } })
-                }
-            }
-        } else if (section == 1) {
-            if (notes.isEmpty()) {
-                item { EmptySharedState("Sin notas todavía", "Dejad aquí lo que queráis recordar entre los dos.") }
-            } else {
-                items(notes, key = { "note-" + it.id }) { note ->
-                    NoteRow(note, membersById[note.authorId]?.let(store::memberPhotoUri),
-                        onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
-                }
-            }
-        } else {
-            item {
-                LocationScreen(members, repo.memberId, hasLocationPermission, locationStatus,
-                    onRequestPermission = { fineLocationLauncher.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) },
-                    onShareNow = {
-                        locationStatus = "Buscando tu ubicación…"
-                        scope.launch {
-                            val location = LocationUtil.getCurrentLocation(context)
-                            if (location == null) {
-                                locationStatus = "No se pudo obtener tu ubicación. Comprueba que la ubicación esté activada en el sistema e inténtalo de nuevo."
-                                return@launch
-                            }
-                            runCatching { repo.updateMemberLocation(householdId, location.latitude, location.longitude) }
-                                .onSuccess { locationStatus = "Ubicación compartida." }
-                                .onFailure { locationStatus = "No se pudo guardar tu ubicación. Comprueba tu conexión." }
+    }
+
+    if (section == 2) {
+        // The map handles its own pan/zoom gestures; it must NOT sit inside a scrollable
+        // ancestor (a LazyColumn here would fight the map for drag/pinch gestures and the
+        // whole screen would scroll instead of the map panning).
+        Column(Modifier.fillMaxSize().padding(22.dp)) {
+            header()
+            LocationScreen(members, repo.memberId, hasLocationPermission, locationStatus,
+                modifier = Modifier.weight(1f), store = store,
+                onRequestPermission = { fineLocationLauncher.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) },
+                onShareNow = {
+                    locationStatus = "Buscando tu ubicación…"
+                    scope.launch {
+                        val location = LocationUtil.getCurrentLocation(context)
+                        if (location == null) {
+                            locationStatus = "No se pudo obtener tu ubicación. Comprueba que la ubicación esté activada en el sistema e inténtalo de nuevo."
+                            return@launch
                         }
-                    })
+                        runCatching { repo.updateMemberLocation(householdId, location.latitude, location.longitude) }
+                            .onSuccess { locationStatus = "Ubicación compartida." }
+                            .onFailure { locationStatus = "No se pudo guardar tu ubicación. Comprueba tu conexión." }
+                    }
+                })
+        }
+    } else {
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { header() }
+            if (section == 0) {
+                if (tasks.isEmpty()) {
+                    item { EmptySharedState("Sin tareas por ahora", "Añadid lo primero que se os ocurra para la casa.") }
+                } else {
+                    items(tasks, key = { "task-" + it.id }) { task ->
+                        TaskRow(task, membersById[task.createdById]?.let(store::memberPhotoUri),
+                            onToggle = { scope.launch { runCatching { repo.setTaskDone(householdId, task.id, !task.done) } } },
+                            onDelete = { scope.launch { runCatching { repo.deleteTask(householdId, task.id) } } })
+                    }
+                }
+            } else {
+                if (notes.isEmpty()) {
+                    item { EmptySharedState("Sin notas todavía", "Dejad aquí lo que queráis recordar entre los dos.") }
+                } else {
+                    items(notes, key = { "note-" + it.id }) { note ->
+                        NoteRow(note, membersById[note.authorId]?.let(store::memberPhotoUri),
+                            onDelete = { scope.launch { runCatching { repo.deleteNote(householdId, note.id) } } })
+                    }
+                }
             }
         }
     }
@@ -1076,13 +1100,101 @@ private fun ProfileSheet(initialName: String, initialPhoto: Uri?,
     }
 }
 
+/** CARTO's free basemap tiles (no API key): a soft, uncluttered style closer to Life360 than raw OSM Mapnik. */
+private val CartoVoyagerTileSource = org.osmdroid.tileprovider.tilesource.XYTileSource(
+    "CartoVoyager", 0, 19, 512, "@2x.png",
+    arrayOf(
+        "https://a.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://b.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://c.basemaps.cartocdn.com/rastertiles/voyager/",
+        "https://d.basemaps.cartocdn.com/rastertiles/voyager/",
+    ),
+)
+private val CartoDarkTileSource = org.osmdroid.tileprovider.tilesource.XYTileSource(
+    "CartoDarkMatter", 0, 19, 512, "@2x.png",
+    arrayOf(
+        "https://a.basemaps.cartocdn.com/rastertiles/dark_all/",
+        "https://b.basemaps.cartocdn.com/rastertiles/dark_all/",
+        "https://c.basemaps.cartocdn.com/rastertiles/dark_all/",
+        "https://d.basemaps.cartocdn.com/rastertiles/dark_all/",
+    ),
+)
+
+/** Draws a Life360-style avatar pin: a circular photo (or initial) bubble in the member's color, with a pointer tail. */
+private fun buildAvatarMarkerIcon(context: Context, photoUri: Uri?, name: String, ringColor: Int): BitmapDrawable {
+    val density = context.resources.displayMetrics.density
+    val circleDiameter = 50f * density
+    val ringWidth = 3f * density
+    val tailHeight = 9f * density
+    val pad = 6f * density
+    val size = circleDiameter + pad * 2
+    val width = size.toInt()
+    val height = (size + tailHeight).toInt()
+    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val cx = width / 2f
+    val cy = size / 2f
+    val radius = circleDiameter / 2f
+    val innerRadius = radius - ringWidth
+
+    canvas.drawCircle(cx, cy + 2f * density, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.argb(0x40, 0, 0, 0)
+        maskFilter = BlurMaskFilter(4f * density, BlurMaskFilter.Blur.NORMAL)
+    })
+    canvas.drawCircle(cx, cy, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.WHITE })
+
+    val photoBitmap = photoUri?.let { uri ->
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, BitmapFactory.Options().apply { inSampleSize = 4 })
+            }
+        }.getOrNull()
+    }
+    if (photoBitmap != null) {
+        val scale = (innerRadius * 2) / minOf(photoBitmap.width, photoBitmap.height).toFloat()
+        val matrix = Matrix().apply {
+            setScale(scale, scale)
+            postTranslate(
+                cx - innerRadius - (photoBitmap.width * scale - innerRadius * 2) / 2f,
+                cy - innerRadius - (photoBitmap.height * scale - innerRadius * 2) / 2f,
+            )
+        }
+        val shader = BitmapShader(photoBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply { setLocalMatrix(matrix) }
+        canvas.drawCircle(cx, cy, innerRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply { this.shader = shader })
+    } else {
+        canvas.drawCircle(cx, cy, innerRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ringColor })
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            textAlign = Paint.Align.CENTER
+            textSize = innerRadius
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        canvas.drawText(name.take(1).uppercase(), cx, cy - (textPaint.descent() + textPaint.ascent()) / 2f, textPaint)
+    }
+
+    canvas.drawCircle(cx, cy, radius - ringWidth / 2f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ringColor; style = Paint.Style.STROKE; strokeWidth = ringWidth
+    })
+    canvas.drawPath(Path().apply {
+        moveTo(cx - 7f * density, size - 1f)
+        lineTo(cx + 7f * density, size - 1f)
+        lineTo(cx, height.toFloat())
+        close()
+    }, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ringColor })
+
+    return BitmapDrawable(context.resources, bitmap)
+}
+
 @Composable
 private fun LocationScreen(members: List<Member>, ownMemberId: String, hasLocationPermission: Boolean, statusMessage: String,
-    onRequestPermission: () -> Unit, onShareNow: () -> Unit) {
+    modifier: Modifier = Modifier, store: InventoryStore, onRequestPermission: () -> Unit, onShareNow: () -> Unit) {
     val colors = LocalPalette.current
+    val context = LocalContext.current
+    val isDark = colors === DarkPalette
     val located = members.filter { it.lat != null && it.lng != null }
+    val ringPalette = remember(colors) { listOf(colors.pine, colors.danger, colors.peach, colors.pineLight, colors.sand) }
 
-    Column(Modifier.fillMaxWidth()) {
+    Column(modifier.fillMaxWidth()) {
         if (!hasLocationPermission) {
             Surface(color = colors.paper, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1110,34 +1222,68 @@ private fun LocationScreen(members: List<Member>, ownMemberId: String, hasLocati
             EmptySharedState("Sin ubicaciones todavía", "En cuanto alguien comparta su ubicación, aparecerá aquí en el mapa.")
         } else {
             val target = located.firstOrNull { it.id == ownMemberId } ?: located.first()
-            androidx.compose.ui.viewinterop.AndroidView(
-                modifier = Modifier.fillMaxWidth().height(320.dp).clip(RoundedCornerShape(16.dp)),
-                factory = { ctx -> org.osmdroid.views.MapView(ctx).apply { setMultiTouchControls(true) } },
-                update = { mapView ->
-                    mapView.overlays.clear()
-                    located.forEach { member ->
-                        val marker = org.osmdroid.views.overlay.Marker(mapView)
-                        marker.position = org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!)
-                        marker.title = member.name
-                        mapView.overlays.add(marker)
-                    }
-                    mapView.controller.setZoom(14.0)
-                    mapView.controller.setCenter(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
-                    mapView.invalidate()
-                },
-                onRelease = { mapView -> mapView.onDetach() },
-            )
+            val mapViewRef = remember { mutableStateOf<org.osmdroid.views.MapView?>(null) }
+            val markerIcons = remember { mutableMapOf<String, BitmapDrawable>() }
+
+            Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(16.dp))) {
+                androidx.compose.ui.viewinterop.AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        org.osmdroid.views.MapView(ctx).apply {
+                            setMultiTouchControls(true)
+                            setTileSource(if (isDark) CartoDarkTileSource else CartoVoyagerTileSource)
+                            isTilesScaledToDpi = true
+                            minZoomLevel = 3.0
+                            maxZoomLevel = 19.0
+                            overlays.add(org.osmdroid.views.overlay.CopyrightOverlay(ctx))
+                            controller.setZoom(15.0)
+                            // Center once, here at creation, and never again: doing this in `update` would
+                            // snap the camera back and undo the user's own pan/zoom every time a location syncs.
+                            controller.setCenter(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
+                            mapViewRef.value = this
+                        }
+                    },
+                    update = { mapView ->
+                        mapView.overlays.removeAll { it is org.osmdroid.views.overlay.Marker }
+                        located.forEach { member ->
+                            val photoUri = store.memberPhotoUri(member)
+                            val markerIcon = markerIcons.getOrPut("${member.id}|$photoUri|$isDark") {
+                                buildAvatarMarkerIcon(context, photoUri, member.name, ringPalette[(member.id.hashCode() and Int.MAX_VALUE) % ringPalette.size].toArgb())
+                            }
+                            mapView.overlays.add(org.osmdroid.views.overlay.Marker(mapView).apply {
+                                position = org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!)
+                                title = member.name
+                                icon = markerIcon
+                                setAnchor(0.5f, 1f)
+                            })
+                        }
+                        mapView.invalidate()
+                    },
+                    onRelease = { mapView -> mapView.onDetach() },
+                )
+                Box(Modifier.align(Alignment.BottomEnd).padding(14.dp).size(44.dp).clip(CircleShape)
+                    .background(colors.paper).clickable {
+                        mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
+                        mapViewRef.value?.controller?.setZoom(15.0)
+                    }, contentAlignment = Alignment.Center) {
+                    Icon(painterResource(R.drawable.ic_map_pin), contentDescription = "Centrar en mí", tint = colors.pine, modifier = Modifier.size(20.dp))
+                }
+            }
             Spacer(Modifier.height(12.dp))
-            members.forEach { member ->
-                Surface(color = colors.paper, shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(Modifier.size(28.dp).clip(CircleShape).background(colors.mint))
-                        Column(Modifier.weight(1f)) {
+            androidx.compose.foundation.lazy.LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(members, key = { it.id }) { member ->
+                    val isStale = member.locationUpdatedAt == null
+                    Row(Modifier.clip(RoundedCornerShape(14.dp)).background(colors.paper)
+                        .clickable(enabled = !isStale) {
+                            mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!))
+                        }.padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(Modifier.size(28.dp).clip(CircleShape).background(colors.mint)) {
+                            PhotoAvatar(member.name, store.memberPhotoUri(member), Modifier.fillMaxSize(), colors.pineLight, 12.sp)
+                        }
+                        Column {
                             Text(member.name, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             Text(
-                                if (member.locationUpdatedAt != null) "Actualizado ${timeAgo(member.locationUpdatedAt)}" else "Aún no ha compartido su ubicación",
+                                if (member.locationUpdatedAt != null) "Actualizado ${timeAgo(member.locationUpdatedAt)}" else "Sin compartir aún",
                                 color = colors.muted, fontFamily = Manrope, fontSize = 10.sp,
                             )
                         }
