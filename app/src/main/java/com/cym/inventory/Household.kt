@@ -2,8 +2,10 @@ package com.cym.inventory
 
 import android.content.Context
 import android.net.Uri
+import android.util.Base64
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.QuerySnapshot
@@ -45,9 +47,6 @@ internal data class Member(
     val id: String,
     val name: String,
     val photoMime: String? = null,
-    val lat: Double? = null,
-    val lng: Double? = null,
-    val locationUpdatedAt: Long? = null,
 )
 
 private val CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ" // sin 0/O ni 1/I/L, para que se lea y teclee sin líos
@@ -125,15 +124,6 @@ internal class HouseholdRepository(private val context: Context, private val sto
         prefs.edit().clear().apply()
     }
 
-    /** Updates this device's last known location on its member profile. */
-    suspend fun updateMemberLocation(householdId: String, lat: Double, lng: Double) = withContext(Dispatchers.IO) {
-        val id = memberId
-        if (id.isBlank()) return@withContext
-        db.collection("households").document(householdId).collection("members").document(id)
-            .set(mapOf("lat" to lat, "lng" to lng, "locationUpdatedAt" to System.currentTimeMillis()), SetOptions.merge())
-            .await()
-    }
-
     private fun saveLocalHousehold(code: String, name: String) {
         prefs.edit().putString("householdId", code).putString("memberName", name)
             .putLong("lastSyncCheck", System.currentTimeMillis()).apply()
@@ -150,40 +140,161 @@ internal class HouseholdRepository(private val context: Context, private val sto
         db.collection("households").document(householdId).collection("items")
             .snapshots().map { snapshot -> snapshot.documents.mapNotNull { it.toInventoryItem() } }
 
+    private fun itemsCol(householdId: String) =
+        db.collection("households").document(householdId).collection("items")
+
+    private fun filesCol(householdId: String) =
+        db.collection("households").document(householdId).collection("files")
+
+    private fun receiptChunkId(itemId: String, index: Int) = "$itemId-receipt-$index"
+
     suspend fun saveItem(householdId: String, item: InventoryItem, pickedPhoto: Uri?, pickedReceipt: Uri?) =
         withContext(Dispatchers.IO) {
             var photoMime = item.photoMime
-            var receiptMime = item.receiptMime
-            var photoBase64: Any? = null
-            var receiptBase64: Any? = null
+            var photoBase64: String? = null
             if (pickedPhoto != null) {
                 photoMime = store.cachePickedFile(pickedPhoto, "photos", item.id)
                 photoBase64 = store.prepareUpload("photos", item.id, photoMime, InventoryStore.PHOTO_MAX_BYTES)
-                    ?: throw AttachmentTooLargeException("La foto es demasiado grande. Prueba con otra imagen.")
+                    ?: throw AttachmentTooLargeException("No se ha podido procesar la foto. Prueba con otra imagen.")
             }
+            var receiptMime = item.receiptMime
+            var receiptChunks = item.receiptChunks
+            var receiptVersion = item.receiptVersion
             if (pickedReceipt != null) {
+                // El ticket va troceado en su propia colección: así un PDF de varios MB no choca con el límite de 1 MB por documento.
+                receiptVersion = System.currentTimeMillis()
+                store.deleteLocalMedia("receipts", item.id)
                 receiptMime = store.cachePickedFile(pickedReceipt, "receipts", item.id)
-                receiptBase64 = store.prepareUpload("receipts", item.id, receiptMime, InventoryStore.RECEIPT_MAX_BYTES)
+                val bytes = store.prepareReceiptBytes(item.id, receiptMime)
                     ?: throw AttachmentTooLargeException(
-                        "El ticket es demasiado grande (máx. ~${InventoryStore.RECEIPT_MAX_BYTES / 1000} KB si es PDF). " +
-                            "Prueba a escanearlo con menor calidad o hazle una foto en vez de adjuntar el PDF.")
+                        "El ticket es demasiado grande. Los PDF pueden ocupar hasta " +
+                            "${InventoryStore.RECEIPT_PDF_MAX_BYTES / 1_000_000} MB; si es más grande, hazle una foto.")
+                receiptChunks = uploadReceiptChunks(householdId, item.id, bytes, previousChunks = item.receiptChunks)
             }
-            val combinedBase64Length = ((photoBase64 as? String)?.length ?: 0) + ((receiptBase64 as? String)?.length ?: 0)
-            if (combinedBase64Length > InventoryStore.FIRESTORE_ATTACHMENTS_BUDGET) {
-                throw AttachmentTooLargeException("La foto y el ticket juntos son demasiado grandes. Reduce el tamaño de uno de los dos.")
-            }
-            val data = item.copy(photoMime = photoMime, receiptMime = receiptMime,
+            val data: MutableMap<String, Any?> = item.copy(photoMime = photoMime, receiptMime = receiptMime,
+                receiptChunks = receiptChunks, receiptVersion = receiptVersion,
                 updatedAt = System.currentTimeMillis()).toMap().toMutableMap()
             if (photoBase64 != null) data["photoData"] = photoBase64
-            if (receiptBase64 != null) data["receiptData"] = receiptBase64
-            db.collection("households").document(householdId).collection("items").document(item.id)
-                .set(data, SetOptions.merge()).await()
+            // Con el ticket ya troceado, se quita la copia antigua incrustada en el documento, si la había.
+            if (pickedReceipt != null) data["receiptData"] = FieldValue.delete()
+            itemsCol(householdId).document(item.id).set(data, SetOptions.merge()).await()
         }
 
+    private suspend fun uploadReceiptChunks(householdId: String, itemId: String, bytes: ByteArray, previousChunks: Int): Int {
+        val chunks = (bytes.indices step InventoryStore.RECEIPT_CHUNK_BYTES).map { start ->
+            bytes.copyOfRange(start, minOf(start + InventoryStore.RECEIPT_CHUNK_BYTES, bytes.size))
+        }
+        chunks.forEachIndexed { index, chunk ->
+            filesCol(householdId).document(receiptChunkId(itemId, index)).set(mapOf(
+                "itemId" to itemId,
+                "index" to index,
+                "data" to Base64.encodeToString(chunk, Base64.NO_WRAP),
+            )).await()
+        }
+        // Si el ticket anterior tenía más trozos, sobran.
+        for (index in chunks.size until previousChunks) {
+            runCatching { filesCol(householdId).document(receiptChunkId(itemId, index)).delete().await() }
+        }
+        return chunks.size
+    }
+
+    /** Descarga el ticket troceado a la caché local la primera vez que se abre en este móvil. */
+    suspend fun downloadReceipt(householdId: String, item: InventoryItem): Uri? = withContext(Dispatchers.IO) {
+        store.receiptUri(item)?.let { return@withContext it }
+        val mime = item.receiptMime ?: return@withContext null
+        if (item.receiptChunks <= 0) return@withContext null
+        val chunks = (0 until item.receiptChunks).map { index ->
+            filesCol(householdId).document(receiptChunkId(item.id, index)).get().await().getString("data")
+                ?: return@withContext null
+        }
+        store.writeReceiptFromChunks(item.id, mime, chunks)
+        store.receiptUri(item)
+    }
+
     suspend fun deleteItem(householdId: String, item: InventoryItem) = withContext(Dispatchers.IO) {
-        db.collection("households").document(householdId).collection("items").document(item.id).delete().await()
+        itemsCol(householdId).document(item.id).delete().await()
+        for (index in 0 until item.receiptChunks) {
+            runCatching { filesCol(householdId).document(receiptChunkId(item.id, index)).delete().await() }
+        }
         store.deleteLocalMedia("photos", item.id)
         store.deleteLocalMedia("receipts", item.id)
+    }
+
+    // ---------- Rooms ----------
+
+    fun roomsFlow(householdId: String): Flow<List<Room>> =
+        db.collection("households").document(householdId).collection("rooms")
+            .snapshots().map { snapshot ->
+                snapshot.documents.mapNotNull { it.toRoom() }.sortedWith(compareBy({ it.order }, { normalizeKey(it.name) }))
+            }
+
+    /**
+     * La primera vez crea las habitaciones por defecto y las que ya se escribían a mano en los artículos,
+     * unificando las que solo cambian en tildes o mayúsculas ("salon" = "Salón"). Los ids derivan del nombre,
+     * así que si los dos móviles lo ejecutan a la vez escriben los mismos documentos y no se duplica nada.
+     */
+    suspend fun ensureRooms(householdId: String) = withContext(Dispatchers.IO) {
+        val home = db.collection("households").document(householdId)
+        if (home.get().await().getBoolean("roomsInitialized") == true) return@withContext
+        val roomsCol = home.collection("rooms")
+        val names = LinkedHashMap<String, Pair<String, String>>()
+        DEFAULT_ROOMS.forEach { (name, icon) -> names[roomSlug(name)] = name to icon }
+        itemsCol(householdId).get().await().documents
+            .mapNotNull { it.getString("room")?.trim() }
+            .filter(String::isNotBlank)
+            .forEach { name -> names.putIfAbsent(roomSlug(name), name.replaceFirstChar { it.uppercase() } to DEFAULT_ROOM_ICON) }
+        val existing = roomsCol.get().await().documents.map { it.id }.toSet()
+        val batch = db.batch()
+        names.entries.forEachIndexed { index, (slug, value) ->
+            if (slug.isNotBlank() && slug !in existing) {
+                batch.set(roomsCol.document(slug), mapOf("name" to value.first, "icon" to value.second, "order" to index))
+            }
+        }
+        batch.commit().await()
+        runCatching { home.set(mapOf("roomsInitialized" to true), SetOptions.merge()).await() }
+    }
+
+    /** Asigna roomId a los artículos antiguos que solo tenían el nombre de la habitación escrito. */
+    suspend fun assignRoomIds(householdId: String, items: List<InventoryItem>, rooms: List<Room>) = withContext(Dispatchers.IO) {
+        val bySlug = rooms.associateBy { roomSlug(it.name) } + rooms.associateBy { it.id }
+        val updates = items.filter { it.roomId.isBlank() && it.room.isNotBlank() }
+            .mapNotNull { item -> bySlug[roomSlug(item.room)]?.let { item to it } }
+        if (updates.isEmpty()) return@withContext
+        updates.chunked(400).forEach { chunk ->
+            val batch = db.batch()
+            chunk.forEach { (item, room) ->
+                batch.update(itemsCol(householdId).document(item.id), mapOf("roomId" to room.id, "room" to room.name))
+            }
+            batch.commit().await()
+        }
+    }
+
+    /** Crea o actualiza una habitación. Si cambia el nombre, lo actualiza también en sus artículos. */
+    suspend fun saveRoom(householdId: String, room: Room, previousName: String?) = withContext(Dispatchers.IO) {
+        db.collection("households").document(householdId).collection("rooms").document(room.id)
+            .set(mapOf("name" to room.name, "icon" to room.icon, "order" to room.order)).await()
+        if (previousName != null && previousName != room.name) {
+            itemsCol(householdId).whereEqualTo("roomId", room.id).get().await().documents.chunked(400).forEach { chunk ->
+                val batch = db.batch()
+                chunk.forEach { batch.update(it.reference, "room", room.name) }
+                batch.commit().await()
+            }
+        }
+    }
+
+    /** Borra una habitación pasando antes sus artículos a [moveTo] (o a "sin habitación"). */
+    suspend fun deleteRoom(householdId: String, room: Room, moveTo: Room?) = withContext(Dispatchers.IO) {
+        itemsCol(householdId).whereEqualTo("roomId", room.id).get().await().documents.chunked(400).forEach { chunk ->
+            val batch = db.batch()
+            chunk.forEach { batch.update(it.reference, mapOf("roomId" to (moveTo?.id ?: ""), "room" to (moveTo?.name ?: ""))) }
+            batch.commit().await()
+        }
+        db.collection("households").document(householdId).collection("rooms").document(room.id).delete().await()
+    }
+
+    private fun DocumentSnapshot.toRoom(): Room? {
+        val name = getString("name") ?: return null
+        return Room(id = id, name = name, icon = getString("icon") ?: DEFAULT_ROOM_ICON, order = getLong("order")?.toInt() ?: 0)
     }
 
     // ---------- Wishlist ----------
@@ -257,9 +368,10 @@ internal class HouseholdRepository(private val context: Context, private val sto
     // ---------- Mapping ----------
 
     private fun InventoryItem.toMap(): Map<String, Any?> = mapOf(
-        "name" to name, "room" to room, "category" to category, "status" to status.name,
+        "name" to name, "room" to room, "roomId" to roomId, "category" to category, "status" to status.name,
         "priceCents" to priceCents, "purchaseDate" to purchaseDate,
-        "receiptMime" to receiptMime, "photoMime" to photoMime,
+        "receiptMime" to receiptMime, "receiptChunks" to receiptChunks, "receiptVersion" to receiptVersion,
+        "photoMime" to photoMime,
         "shop" to shop, "description" to description, "location" to location, "purpose" to purpose,
         "paidBy" to paidBy, "paidById" to paidById,
         "updatedAt" to updatedAt,
@@ -275,11 +387,14 @@ internal class HouseholdRepository(private val context: Context, private val sto
             id = id,
             name = name,
             room = getString("room") ?: "",
+            roomId = getString("roomId") ?: "",
             category = getString("category") ?: "",
             status = runCatching { ItemStatus.valueOf(getString("status") ?: "PLANNED") }.getOrDefault(ItemStatus.PLANNED),
             priceCents = getLong("priceCents"),
             purchaseDate = getString("purchaseDate"),
             receiptMime = receiptMime,
+            receiptChunks = getLong("receiptChunks")?.toInt() ?: 0,
+            receiptVersion = getLong("receiptVersion") ?: 0L,
             photoMime = photoMime,
             shop = getString("shop") ?: "",
             description = getString("description") ?: "",
@@ -343,8 +458,7 @@ internal class HouseholdRepository(private val context: Context, private val sto
         val name = getString("name") ?: return null
         val photoMime = getString("photoMime")
         if (photoMime != null) getString("photoData")?.let { store.materializeFromBase64("member-photos", id, photoMime, it) }
-        return Member(id = id, name = name, photoMime = photoMime,
-            lat = getDouble("lat"), lng = getDouble("lng"), locationUpdatedAt = getLong("locationUpdatedAt"))
+        return Member(id = id, name = name, photoMime = photoMime)
     }
 }
 

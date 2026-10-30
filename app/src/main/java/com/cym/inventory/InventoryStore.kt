@@ -20,11 +20,17 @@ internal data class InventoryItem(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
     val room: String = "",
+    /** Id de la habitación (colección rooms). Los artículos antiguos solo tenían [room] con el nombre escrito a mano. */
+    val roomId: String = "",
     val category: String = "",
     val status: ItemStatus = ItemStatus.PLANNED,
     val priceCents: Long? = null,
     val purchaseDate: String? = null,
     val receiptMime: String? = null,
+    /** Trozos del ticket en households/{id}/files. 0 = ticket antiguo incrustado en el propio documento (o sin ticket). */
+    val receiptChunks: Int = 0,
+    /** Marca de tiempo de la última subida del ticket; invalida la copia local si el otro móvil lo cambia. */
+    val receiptVersion: Long = 0L,
     val photoMime: String? = null,
     val shop: String = "",
     val description: String = "",
@@ -135,7 +141,9 @@ internal class InventoryStore(private val context: Context) {
         .buildUpon().appendQueryParameter("t", file.lastModified().toString()).build()
 
     fun photoUri(item: InventoryItem): Uri? = item.photoMime?.let { mediaFile("photos", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
-    fun receiptUri(item: InventoryItem): Uri? = item.receiptMime?.let { mediaFile("receipts", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
+    fun receiptUri(item: InventoryItem): Uri? = item.receiptMime?.let { mediaFile("receipts", item.id, it) }
+        ?.takeIf { it.exists() && (item.receiptVersion == 0L || it.lastModified() >= item.receiptVersion - 5_000) }
+        ?.let(::toFileProviderUri)
     fun wishlistPhotoUri(item: WishlistItem): Uri? = item.photoMime?.let { mediaFile("wishlist-photos", item.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
     fun memberPhotoUri(member: Member): Uri? = member.photoMime?.let { mediaFile("member-photos", member.id, it) }?.takeIf(File::exists)?.let(::toFileProviderUri)
     fun receiptMimeType(item: InventoryItem): String = item.receiptMime ?: "image/jpeg"
@@ -173,7 +181,35 @@ internal class InventoryStore(private val context: Context) {
         return bytes?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
     }
 
+    /** Bytes del ticket listos para subir: los PDF tal cual (con límite) y las imágenes comprimidas. null si no cabe. */
+    fun prepareReceiptBytes(id: String, mime: String): ByteArray? {
+        val file = mediaFile("receipts", id, mime)
+        if (!file.exists()) return null
+        return if (mime == "application/pdf") file.takeIf { it.length() <= RECEIPT_PDF_MAX_BYTES }?.readBytes()
+            else compressImage(file, PHOTO_MAX_BYTES)
+    }
+
+    /** Reconstruye en la caché local un ticket descargado por trozos. */
+    fun writeReceiptFromChunks(id: String, mime: String, chunks: List<String>) {
+        val file = mediaFile("receipts", id, mime)
+        file.parentFile?.mkdirs()
+        file.outputStream().use { out -> chunks.forEach { out.write(Base64.decode(it, Base64.NO_WRAP)) } }
+    }
+
+    /** Uri temporal donde la cámara guarda la foto que se acaba de hacer. */
+    fun newCameraUri(): Uri {
+        val directory = File(context.cacheDir, "camera").apply { mkdirs() }
+        val file = File(directory, "${UUID.randomUUID()}.jpg")
+        return FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+    }
+
     companion object {
+        /** Tamaño máximo de un ticket en PDF. Se guarda troceado, así que no depende del límite de 1 MB por documento. */
+        const val RECEIPT_PDF_MAX_BYTES = 4_000_000
+
+        /** Tamaño de cada trozo antes de base64 (≈ 800 KB en base64, por debajo del límite de Firestore). */
+        const val RECEIPT_CHUNK_BYTES = 600_000
+
         /** Firestore's hard per-document limit is 1,048,576 bytes; this leaves headroom for the item's other fields. */
         const val FIRESTORE_ATTACHMENTS_BUDGET = 950_000
 
