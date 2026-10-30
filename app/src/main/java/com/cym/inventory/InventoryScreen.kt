@@ -4,17 +4,7 @@ import android.app.DatePickerDialog
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.BitmapShader
-import android.graphics.BlurMaskFilter
-import android.graphics.Canvas
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.Shader
-import android.graphics.Typeface
-import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -51,7 +41,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import android.widget.Toast
 import androidx.compose.material3.Button
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -83,7 +79,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalContext
@@ -106,11 +101,11 @@ import java.text.NumberFormat
 import java.time.LocalDate
 import java.util.Locale
 
-private val Syne = FontFamily(Font(R.font.syne, weight = FontWeight.Normal))
-private val Manrope = FontFamily(Font(R.font.manrope, weight = FontWeight.Normal))
+internal val Syne = FontFamily(Font(R.font.syne, weight = FontWeight.Normal))
+internal val Manrope = FontFamily(Font(R.font.manrope, weight = FontWeight.Normal))
 
 /** Named palette so every screen can react to light/dark mode without duplicating colors. */
-private data class Palette(
+internal data class Palette(
     val cream: Color,
     val paper: Color,
     val ink: Color,
@@ -125,7 +120,7 @@ private data class Palette(
     val onPine: Color,
 )
 
-private val LightPalette = Palette(
+internal val LightPalette = Palette(
     cream = Color(0xFFF5F3ED),
     paper = Color(0xFFFFFEFA),
     ink = Color(0xFF1D2924),
@@ -140,7 +135,7 @@ private val LightPalette = Palette(
     onPine = Color(0xFFFFFEFA),
 )
 
-private val DarkPalette = Palette(
+internal val DarkPalette = Palette(
     cream = Color(0xFF101613),
     paper = Color(0xFF1C2621),
     ink = Color(0xFFF3F6F1),
@@ -155,14 +150,13 @@ private val DarkPalette = Palette(
     onPine = Color(0xFFF5F3ED),
 )
 
-private val LocalPalette = staticCompositionLocalOf { LightPalette }
+internal val LocalPalette = staticCompositionLocalOf { LightPalette }
 
 private enum class Tab(val title: String, val icon: Int) {
     PLANNED("Por comprar", R.drawable.ic_pending),
     HOME("En casa", R.drawable.ic_home),
     WISHLIST("Deseados", R.drawable.ic_wishlist),
     SHARED("Compartido", R.drawable.ic_shared),
-    LOCATION("Dónde estamos", R.drawable.ic_map_pin),
     EXPENSES("Gastos", R.drawable.ic_expenses),
 }
 
@@ -315,27 +309,38 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
     val scope = rememberCoroutineScope()
     val itemsFlow = remember(householdId) { repo.itemsFlow(householdId) }
     val wishlistFlow = remember(householdId) { repo.wishlistFlow(householdId) }
-    val items by itemsFlow.collectAsState(initial = emptyList())
+    val roomsFlow = remember(householdId) { repo.roomsFlow(householdId) }
+    val rawItems by itemsFlow.collectAsState(initial = emptyList())
     val wishlist by wishlistFlow.collectAsState(initial = emptyList())
+    val rooms by roomsFlow.collectAsState(initial = emptyList())
+    // El nombre de la habitación sale siempre de la lista de habitaciones: un renombrado se ve en todas partes al momento.
+    val items = remember(rawItems, rooms) {
+        val byId = rooms.associateBy { it.id }
+        rawItems.map { item -> byId[item.effectiveRoomId()]?.let { item.copy(roomId = it.id, room = it.name) } ?: item }
+    }
+    val categories = remember(items) {
+        items.map { it.category.trim() }.filter(String::isNotBlank).distinctBy(::normalizeKey).sortedBy(::normalizeKey)
+    }
     var receiptError by remember { mutableStateOf("") }
     var tab by remember { mutableStateOf(Tab.PLANNED) }
     var sheetItem by remember { mutableStateOf<InventoryItem?>(null) }
     var sheetPurchase by remember { mutableStateOf(false) }
+    var sheetRoomId by remember { mutableStateOf("") }
     var sheetOpen by remember { mutableStateOf(false) }
     var wishlistSheetItem by remember { mutableStateOf<WishlistItem?>(null) }
     var wishlistSheetOpen by remember { mutableStateOf(false) }
+    var roomsManagerOpen by remember { mutableStateOf(false) }
     var mediaViewerUri by remember { mutableStateOf<Uri?>(null) }
 
-    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    LaunchedEffect(householdId) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-        }
+    LaunchedEffect(householdId) { runCatching { repo.ensureRooms(householdId) } }
+    LaunchedEffect(rawItems, rooms) {
+        if (rooms.isNotEmpty()) runCatching { repo.assignRoomIds(householdId, rawItems, rooms) }
     }
 
-    fun openSheet(item: InventoryItem?, purchase: Boolean) {
+    fun openSheet(item: InventoryItem?, purchase: Boolean, roomId: String = "") {
         sheetItem = item
         sheetPurchase = purchase
+        sheetRoomId = roomId
         sheetOpen = true
     }
     fun saveItem(item: InventoryItem, pickedPhoto: Uri?, pickedReceipt: Uri?) {
@@ -348,9 +353,28 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
                 .onFailure { receiptError = it.toSaveErrorMessage() }
         }
     }
+    fun quickAdd(name: String, roomId: String) {
+        val room = rooms.firstOrNull { it.id == roomId }
+        scope.launch {
+            runCatching { repo.saveItem(householdId, InventoryItem(name = name, roomId = room?.id ?: "", room = room?.name ?: ""), null, null) }
+                .onFailure { receiptError = it.toSaveErrorMessage() }
+        }
+    }
     fun deleteItem(item: InventoryItem) {
         sheetOpen = false
         scope.launch { runCatching { repo.deleteItem(householdId, item) } }
+    }
+    fun saveRoom(room: Room, previousName: String?) {
+        scope.launch {
+            runCatching { repo.saveRoom(householdId, room, previousName) }
+                .onFailure { receiptError = "No se pudo guardar la habitación. Comprueba tu conexión." }
+        }
+    }
+    fun deleteRoom(room: Room, moveTo: Room?) {
+        scope.launch {
+            runCatching { repo.deleteRoom(householdId, room, moveTo) }
+                .onFailure { receiptError = "No se pudo eliminar la habitación. Comprueba tu conexión." }
+        }
     }
 
     fun openWishlistSheet(item: WishlistItem?) {
@@ -378,22 +402,26 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
     }
 
     fun openReceipt(item: InventoryItem) {
-        val uri = store.receiptUri(item)
-        if (uri == null) {
-            receiptError = "El ticket aún no se ha sincronizado en este móvil. Prueba de nuevo en un momento."
-            return
-        }
-        if (store.receiptMimeType(item).startsWith("image/")) {
-            mediaViewerUri = uri
-            return
-        }
-        try {
-            context.startActivity(Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, store.receiptMimeType(item))
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            })
-        } catch (_: ActivityNotFoundException) {
-            receiptError = "Instala una app que pueda abrir este ticket."
+        scope.launch {
+            val cached = store.receiptUri(item)
+            if (cached == null) Toast.makeText(context, "Descargando ticket…", Toast.LENGTH_SHORT).show()
+            val uri = cached ?: runCatching { repo.downloadReceipt(householdId, item) }.getOrNull()
+            if (uri == null) {
+                receiptError = "No se pudo descargar el ticket. Comprueba tu conexión e inténtalo de nuevo."
+                return@launch
+            }
+            if (store.receiptMimeType(item).startsWith("image/")) {
+                mediaViewerUri = uri
+                return@launch
+            }
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, store.receiptMimeType(item))
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                })
+            } catch (_: ActivityNotFoundException) {
+                receiptError = "Instala una app que pueda abrir este ticket."
+            }
         }
     }
 
@@ -423,19 +451,19 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
     Column(Modifier.fillMaxSize().background(colors.cream).windowInsetsPadding(WindowInsets.safeDrawing)) {
         Box(Modifier.weight(1f)) {
             when (tab) {
-                Tab.PLANNED -> PlannedScreen(items.filter { it.status == ItemStatus.PLANNED }, store,
-                    recentHome = items.filter { it.status == ItemStatus.PURCHASED }.take(3),
-                    onAdd = { openSheet(null, false) }, onBuy = { openSheet(it, true) },
-                    onEdit = { openSheet(it, false) }, onOpenHome = { openSheet(it, true) },
-                    onSeeAllHome = { tab = Tab.HOME })
-                Tab.HOME -> HomeScreen(items.filter { it.status == ItemStatus.PURCHASED }, store,
-                    onAddPurchase = { openSheet(null, true) }, onEdit = { openSheet(it, true) },
-                    onReceipt = ::openReceipt, onPhoto = ::openPhoto, onExport = ::exportInventory)
+                Tab.PLANNED -> PlannedScreen(items.filter { it.status == ItemStatus.PLANNED }, store, rooms,
+                    recentHome = items.filter { it.status == ItemStatus.PURCHASED }.sortedByDescending { it.updatedAt }.take(3),
+                    onAdd = { roomId -> openSheet(null, false, roomId) }, onQuickAdd = ::quickAdd,
+                    onBuy = { openSheet(it, true) }, onEdit = { openSheet(it, false) },
+                    onOpenHome = { openSheet(it, true) }, onSeeAllHome = { tab = Tab.HOME })
+                Tab.HOME -> HomeScreen(items.filter { it.status == ItemStatus.PURCHASED }, items.filter { it.status == ItemStatus.PLANNED },
+                    rooms, store, onAddPurchase = { openSheet(null, true) }, onEdit = { openSheet(it, true) },
+                    onReceipt = ::openReceipt, onPhoto = ::openPhoto, onExport = ::exportInventory,
+                    onManageRooms = { roomsManagerOpen = true })
                 Tab.WISHLIST -> WishlistScreen(wishlist, store,
                     onAdd = { openWishlistSheet(null) }, onEdit = { openWishlistSheet(it) },
                     onDelete = ::deleteWishlistItem, onMoveToPending = ::moveWishlistToPending)
                 Tab.SHARED -> SharedScreen(store, repo, householdId)
-                Tab.LOCATION -> WhereScreen(store, repo, householdId)
                 Tab.EXPENSES -> ExpenseScreen(items.filter { it.status == ItemStatus.PURCHASED })
             }
             Box(Modifier.align(Alignment.TopEnd).padding(top = 20.dp, end = 20.dp).size(38.dp)
@@ -462,9 +490,13 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
             item = sheetItem,
             purchase = sheetPurchase,
             store = store,
+            rooms = rooms,
+            categories = categories,
+            initialRoomId = sheetRoomId,
             onDismiss = { sheetOpen = false },
             onSave = ::saveItem,
             onDelete = ::deleteItem,
+            onCreateRoom = { room -> saveRoom(room, null) },
         )
     }
     if (wishlistSheetOpen) {
@@ -475,18 +507,31 @@ internal fun InventoryApp(store: InventoryStore, repo: HouseholdRepository, hous
             onSave = ::saveWishlistItem,
         )
     }
+    if (roomsManagerOpen) {
+        RoomsManagerSheet(rooms, items, onDismiss = { roomsManagerOpen = false }, onSave = ::saveRoom, onDelete = ::deleteRoom)
+    }
 }
 
 @Composable
 private fun BrandHeader() {
     val colors = LocalPalette.current
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    val isDebugBuild = LocalContext.current.packageName.endsWith(".debug")
+    // Hueco a la derecha para el botón flotante de modo claro/oscuro, que si no tapa el título.
+    Row(Modifier.fillMaxWidth().padding(end = 46.dp), verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Image(painter = painterResource(R.drawable.cym_icon), contentDescription = null,
             modifier = Modifier.size(34.dp).clip(RoundedCornerShape(11.dp)))
-        Text("Gestión de inventario de nuestro hogar.", color = colors.ink, fontFamily = Syne,
-            fontWeight = FontWeight.Bold, fontSize = 15.sp, lineHeight = 18.sp,
-            modifier = Modifier.weight(1f).padding(top = 2.dp))
-        Box(Modifier.padding(top = 6.dp).size(7.dp).background(Color(0xFF7FAA78), CircleShape))
+        Column(Modifier.weight(1f).padding(top = 2.dp)) {
+            Text("Gestión de inventario de nuestro hogar.", color = colors.ink, fontFamily = Syne,
+                fontWeight = FontWeight.Bold, fontSize = 15.sp, lineHeight = 18.sp)
+            if (isDebugBuild) {
+                Spacer(Modifier.height(5.dp))
+                Text("DEBUG", color = Color.White, fontFamily = Manrope, fontWeight = FontWeight.Bold,
+                    fontSize = 9.sp, letterSpacing = 1.sp,
+                    modifier = Modifier.background(colors.danger, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 7.dp, vertical = 2.dp))
+            }
+        }
     }
 }
 
@@ -501,9 +546,9 @@ private fun PageLabel(text: String) {
 }
 
 @Composable
-private fun HeroCard(count: Int) {
+private fun HeroCard(count: Int, estimatedCents: Long) {
     val colors = LocalPalette.current
-    Box(Modifier.fillMaxWidth().height(192.dp).background(colors.pine, RoundedCornerShape(27.dp))) {
+    Box(Modifier.fillMaxWidth().heightIn(min = 192.dp).background(colors.pine, RoundedCornerShape(27.dp))) {
         Box(Modifier.align(Alignment.CenterEnd).padding(end = 15.dp).size(135.dp).background(colors.peach, CircleShape))
         Box(Modifier.align(Alignment.CenterEnd).padding(end = 39.dp).width(90.dp).height(122.dp)
             .rotate(16f).background(colors.sand, RoundedCornerShape(topStart = 50.dp, topEnd = 50.dp, bottomStart = 6.dp, bottomEnd = 6.dp)))
@@ -516,21 +561,45 @@ private fun HeroCard(count: Int) {
             Text(count.toString().padStart(2, '0'), color = colors.paper, fontFamily = Syne,
                 fontSize = 68.sp, fontWeight = FontWeight.Bold, letterSpacing = (-3).sp)
             Text("compras pendientes", color = colors.paper, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-            Text("Paso a paso, ya va tomando forma.", color = Color(0xFFAEC7B7), fontFamily = Manrope, fontSize = 10.sp)
+            Text(if (estimatedCents > 0) "≈ ${formatMoney(estimatedCents)} estimados" else "Paso a paso, ya va tomando forma.",
+                color = Color(0xFFAEC7B7), fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 11.sp)
         }
     }
 }
 
+private enum class PlannedSort(val label: String) { RECENT("Recientes"), PRICE("Precio estimado"), NAME("Nombre") }
+
 @Composable
-private fun PlannedScreen(items: List<InventoryItem>, store: InventoryStore, recentHome: List<InventoryItem>, onAdd: () -> Unit,
+private fun PlannedScreen(items: List<InventoryItem>, store: InventoryStore, rooms: List<Room>, recentHome: List<InventoryItem>,
+    onAdd: (roomId: String) -> Unit, onQuickAdd: (name: String, roomId: String) -> Unit,
     onBuy: (InventoryItem) -> Unit, onEdit: (InventoryItem) -> Unit, onOpenHome: (InventoryItem) -> Unit,
     onSeeAllHome: () -> Unit) {
     val colors = LocalPalette.current
     var query by remember { mutableStateOf("") }
-    var room by remember { mutableStateOf("Todas") }
-    val rooms = listOf("Todas", "Salón", "Dormitorio", "Cocina")
-    val filtered = items.filter { (room == "Todas" || it.room.equals(room, true)) &&
-        it.name.contains(query, ignoreCase = true) }
+    var roomFilter by remember { mutableStateOf<String?>(null) }
+    var sort by remember { mutableStateOf(PlannedSort.RECENT) }
+    var quickName by remember { mutableStateOf("") }
+    val counts = remember(items) { items.groupingBy { it.effectiveRoomId() }.eachCount() }
+    val estimatedTotal = items.sumOf { it.priceCents ?: 0L }
+    val filtered = items.filter {
+        (roomFilter == null || it.effectiveRoomId() == roomFilter) &&
+            (query.isBlank() || it.name.contains(query, ignoreCase = true) || it.category.contains(query, ignoreCase = true))
+    }.let { list ->
+        when (sort) {
+            PlannedSort.RECENT -> list.sortedByDescending { it.updatedAt }
+            PlannedSort.PRICE -> list.sortedByDescending { it.priceCents ?: -1L }
+            PlannedSort.NAME -> list.sortedBy { normalizeKey(it.name) }
+        }
+    }
+    // Si hay una habitación filtrada, lo que se añade rápido va a esa habitación.
+    val targetRoomId = roomFilter.orEmpty()
+    val targetRoomName = rooms.firstOrNull { it.id == targetRoomId }?.name
+    fun submitQuickAdd() {
+        val name = quickName.trim()
+        if (name.isEmpty()) return
+        onQuickAdd(name.replaceFirstChar { it.uppercase() }, targetRoomId)
+        quickName = ""
+    }
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 24.dp, bottom = 25.dp),
         verticalArrangement = Arrangement.spacedBy(0.dp)) {
@@ -547,34 +616,54 @@ private fun PlannedScreen(items: List<InventoryItem>, store: InventoryStore, rec
             Text("Todo lo que falta para nuestra casa, claro y al alcance de los dos.",
                 color = colors.muted, fontFamily = Manrope, fontSize = 13.sp, lineHeight = 20.sp)
             Spacer(Modifier.height(24.dp))
-            HeroCard(items.size)
+            HeroCard(items.size, estimatedTotal)
             Spacer(Modifier.height(24.dp))
-            Box(Modifier.fillMaxWidth().height(48.dp).background(colors.paper, RoundedCornerShape(14.dp))
+            // Añadir rápido: nombre + Intro. Los detalles se completan después tocando el artículo.
+            Row(Modifier.fillMaxWidth().height(54.dp).background(colors.paper, RoundedCornerShape(15.dp))
+                .padding(start = 15.dp, end = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                    BasicTextField(quickName, onValueChange = { quickName = it }, singleLine = true,
+                        textStyle = TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 13.sp),
+                        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { submitQuickAdd() }),
+                        modifier = Modifier.fillMaxWidth(),
+                        decorationBox = { inner ->
+                            if (quickName.isEmpty()) {
+                                Text(if (targetRoomName != null) "Añadir a $targetRoomName…" else "Añade algo que falta…",
+                                    color = colors.muted, fontFamily = Manrope, fontSize = 13.sp)
+                            }
+                            inner()
+                        })
+                }
+                Box(Modifier.size(40.dp).clip(RoundedCornerShape(11.dp))
+                    .background(if (quickName.isBlank()) colors.mint else colors.pine)
+                    .clickable(enabled = quickName.isNotBlank()) { submitQuickAdd() }, contentAlignment = Alignment.Center) {
+                    Text("＋", color = if (quickName.isBlank()) colors.pine else colors.onPine, fontFamily = Syne,
+                        fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Box(Modifier.fillMaxWidth().height(46.dp).background(colors.paper, RoundedCornerShape(14.dp))
                 .padding(horizontal = 15.dp), contentAlignment = Alignment.CenterStart) {
                 BasicTextField(query, onValueChange = { query = it }, singleLine = true,
-                    textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
+                    textStyle = TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
+                    modifier = Modifier.fillMaxWidth(),
                     decorationBox = { inner ->
                         if (query.isEmpty()) Text("Buscar en pendientes", color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
                         inner()
                     })
             }
             Spacer(Modifier.height(12.dp))
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                rooms.forEach { choice ->
-                    val selected = room == choice
-                    Box(Modifier.background(if (selected) colors.pine else colors.paper, CircleShape).clickable { room = choice }
-                        .padding(horizontal = 13.dp, vertical = 9.dp)) {
-                        Text(choice, color = if (selected) colors.paper else colors.muted, fontFamily = Manrope,
-                            fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                    }
-                }
-            }
+            RoomFilterChips(rooms, counts, roomFilter) { roomFilter = it }
             Spacer(Modifier.height(24.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
-                Text("Pendientes", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold,
-                    fontSize = 23.sp, letterSpacing = (-1).sp)
-                Text("${filtered.size} artículos", color = colors.muted, fontFamily = Manrope,
-                    fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Column {
+                    Text("Pendientes", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold,
+                        fontSize = 23.sp, letterSpacing = (-1).sp)
+                    Text(if (filtered.size == 1) "1 artículo" else "${filtered.size} artículos", color = colors.muted,
+                        fontFamily = Manrope, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+                SortSelector(PlannedSort.entries.map { it to it.label }, sort) { sort = it }
             }
             Spacer(Modifier.height(15.dp))
         }
@@ -584,7 +673,7 @@ private fun PlannedScreen(items: List<InventoryItem>, store: InventoryStore, rec
                     Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                         Text(if (items.isEmpty()) "Empezad vuestra lista" else "No hay coincidencias",
                             color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        Text(if (items.isEmpty()) "Añadid lo que aún falta para casa. Aparecerá aquí en ambos móviles cuando conectemos la sincronización."
+                        Text(if (items.isEmpty()) "Escribid arriba lo que falta para casa y pulsad Intro."
                             else "Prueba otra búsqueda o habitación.", color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
                     }
                 }
@@ -598,8 +687,8 @@ private fun PlannedScreen(items: List<InventoryItem>, store: InventoryStore, rec
         item {
             Spacer(Modifier.height(3.dp))
             Box(Modifier.fillMaxWidth().background(colors.mint, RoundedCornerShape(16.dp))
-                .clickable(onClick = onAdd).padding(15.dp), contentAlignment = Alignment.Center) {
-                Text("＋  Añadir algo que falta", color = colors.pine, fontFamily = Manrope,
+                .clickable { onAdd(targetRoomId) }.padding(15.dp), contentAlignment = Alignment.Center) {
+                Text("＋  Añadir con todos los detalles", color = colors.pine, fontFamily = Manrope,
                     fontWeight = FontWeight.Bold, fontSize = 12.sp)
             }
         }
@@ -659,49 +748,98 @@ private fun CompactItemCard(item: InventoryItem, store: InventoryStore, onBuy: (
                 Spacer(Modifier.height(4.dp))
                 Text(item.name, color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold,
                     fontSize = 15.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                if (item.room.isNotBlank()) Text("Para ${item.room.lowercase()}", color = colors.muted,
-                    fontFamily = Manrope, fontSize = 10.sp)
+                item.priceCents?.let { Text("≈ ${formatMoney(it)}", color = colors.muted, fontFamily = Manrope,
+                    fontWeight = FontWeight.Bold, fontSize = 11.sp) }
             }
-            Text("↗", color = colors.pine, fontFamily = Syne, fontWeight = FontWeight.Bold,
-                fontSize = 21.sp, modifier = Modifier.clickable(onClick = onBuy).padding(8.dp))
+            Column(Modifier.clip(RoundedCornerShape(12.dp)).background(colors.mint).clickable(onClick = onBuy)
+                .padding(horizontal = 10.dp, vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("↗", color = colors.pine, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                Text("Comprado", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 8.sp)
+            }
         }
     }
 }
 
+private enum class HomeView { LIST, HOUSE }
+private enum class HomeSort(val label: String) {
+    RECENT("Más recientes"), OLDEST("Más antiguos"), PRICE_DESC("Precio: mayor"), PRICE_ASC("Precio: menor"), NAME("Nombre")
+}
+private enum class Period(val label: String) { ALL("Siempre"), MONTH("Este mes"), QUARTER("Últimos 3 meses"), YEAR("Este año") }
+private enum class TicketFilter(val label: String) { ALL("Todos"), WITH("Con ticket"), WITHOUT("Sin ticket") }
+
 private data class HomeFilters(
     val category: String? = null,
-    val location: String? = null,
     val shop: String? = null,
+    val paidBy: String? = null,
+    val period: Period = Period.ALL,
+    val ticket: TicketFilter = TicketFilter.ALL,
     val minPrice: String = "",
     val maxPrice: String = "",
 ) {
-    val activeCount: Int get() = listOfNotNull(category, location, shop) .size +
-        (if (minPrice.isNotBlank()) 1 else 0) + (if (maxPrice.isNotBlank()) 1 else 0)
+    fun matches(item: InventoryItem, today: LocalDate): Boolean {
+        val price = item.priceCents ?: 0L
+        val min = parseMoney(minPrice)
+        val max = parseMoney(maxPrice)
+        val date = item.purchaseDate?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+        val inPeriod = when (period) {
+            Period.ALL -> true
+            Period.MONTH -> date != null && date.year == today.year && date.month == today.month
+            Period.QUARTER -> date != null && !date.isBefore(today.minusMonths(3))
+            Period.YEAR -> date != null && date.year == today.year
+        }
+        return (category == null || normalizeKey(item.category) == normalizeKey(category)) &&
+            (shop == null || normalizeKey(item.shop) == normalizeKey(shop)) &&
+            (paidBy == null || item.paidBy == paidBy) && inPeriod &&
+            (ticket == TicketFilter.ALL || (ticket == TicketFilter.WITH) == (item.receiptMime != null)) &&
+            (min == null || price >= min) && (max == null || price <= max)
+    }
+
+    /** Filtros activos como chips quitables: texto + cómo quedan los filtros al quitarlo. */
+    fun activeChips(): List<Pair<String, HomeFilters>> = buildList {
+        category?.let { add(it to copy(category = null)) }
+        shop?.let { add(it to copy(shop = null)) }
+        paidBy?.let { add("Pagó $it" to copy(paidBy = null)) }
+        if (period != Period.ALL) add(period.label to copy(period = Period.ALL))
+        if (ticket != TicketFilter.ALL) add(ticket.label to copy(ticket = TicketFilter.ALL))
+        if (minPrice.isNotBlank()) add("Desde $minPrice €" to copy(minPrice = ""))
+        if (maxPrice.isNotBlank()) add("Hasta $maxPrice €" to copy(maxPrice = ""))
+    }
 }
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-private fun HomeScreen(items: List<InventoryItem>, store: InventoryStore, onAddPurchase: () -> Unit,
-    onEdit: (InventoryItem) -> Unit, onReceipt: (InventoryItem) -> Unit, onPhoto: (InventoryItem) -> Unit, onExport: () -> Unit) {
+private fun HomeScreen(items: List<InventoryItem>, pendingItems: List<InventoryItem>, rooms: List<Room>, store: InventoryStore,
+    onAddPurchase: () -> Unit, onEdit: (InventoryItem) -> Unit, onReceipt: (InventoryItem) -> Unit, onPhoto: (InventoryItem) -> Unit,
+    onExport: () -> Unit, onManageRooms: () -> Unit) {
     val colors = LocalPalette.current
+    var view by remember { mutableStateOf(HomeView.LIST) }
     var query by remember { mutableStateOf("") }
+    var roomFilter by remember { mutableStateOf<String?>(null) }
+    var sort by remember { mutableStateOf(HomeSort.RECENT) }
     var filters by remember { mutableStateOf(HomeFilters()) }
     var filterSheetOpen by remember { mutableStateOf(false) }
+    val today = remember { LocalDate.now() }
 
-    val categories = remember(items) { items.map { it.category }.filter(String::isNotBlank).distinct().sorted() }
-    val locations = remember(items) { items.map { it.location }.filter(String::isNotBlank).distinct().sorted() }
-    val shops = remember(items) { items.map { it.shop }.filter(String::isNotBlank).distinct().sorted() }
-    val minCents = filters.minPrice.replace(',', '.').toDoubleOrNull()?.let { (it * 100).toLong() }
-    val maxCents = filters.maxPrice.replace(',', '.').toDoubleOrNull()?.let { (it * 100).toLong() }
+    val categories = remember(items) { items.map { it.category.trim() }.filter(String::isNotBlank).distinctBy(::normalizeKey).sortedBy(::normalizeKey) }
+    val shops = remember(items) { items.map { it.shop.trim() }.filter(String::isNotBlank).distinctBy(::normalizeKey).sortedBy(::normalizeKey) }
+    val payers = remember(items) { items.map { it.paidBy }.filter(String::isNotBlank).distinct().sorted() }
+    val counts = remember(items) { items.groupingBy { it.effectiveRoomId() }.eachCount() }
 
     val filtered = items.filter { item ->
-        (query.isBlank() || item.name.contains(query, ignoreCase = true)) &&
-            (filters.category == null || item.category.equals(filters.category, true)) &&
-            (filters.location == null || item.location.equals(filters.location, true)) &&
-            (filters.shop == null || item.shop.equals(filters.shop, true)) &&
-            (minCents == null || (item.priceCents ?: 0) >= minCents) &&
-            (maxCents == null || (item.priceCents ?: 0) <= maxCents)
+        (roomFilter == null || item.effectiveRoomId() == roomFilter) &&
+            (query.isBlank() || item.name.contains(query, true) || item.shop.contains(query, true) || item.category.contains(query, true)) &&
+            filters.matches(item, today)
+    }.let { list ->
+        when (sort) {
+            HomeSort.RECENT -> list.sortedByDescending { it.purchaseDate ?: "" }
+            HomeSort.OLDEST -> list.sortedBy { it.purchaseDate ?: "9999" }
+            HomeSort.PRICE_DESC -> list.sortedByDescending { it.priceCents ?: 0L }
+            HomeSort.PRICE_ASC -> list.sortedBy { it.priceCents ?: 0L }
+            HomeSort.NAME -> list.sortedBy { normalizeKey(it.name) }
+        }
     }
+    val filteredTotal = filtered.sumOf { it.priceCents ?: 0L }
+    val chips = filters.activeChips()
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
@@ -709,7 +847,7 @@ private fun HomeScreen(items: List<InventoryItem>, store: InventoryStore, onAddP
             Spacer(Modifier.height(30.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 PageLabel("Inventario")
-                Row(Modifier.clickable(onClick = onExport).background(colors.paper, RoundedCornerShape(12.dp))
+                Row(Modifier.clip(RoundedCornerShape(12.dp)).background(colors.paper).clickable(onClick = onExport)
                     .padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Icon(painterResource(R.drawable.ic_export), contentDescription = null, tint = colors.pine, modifier = Modifier.size(14.dp))
@@ -718,108 +856,140 @@ private fun HomeScreen(items: List<InventoryItem>, store: InventoryStore, onAddP
             }
             Spacer(Modifier.height(10.dp))
             Text("Ya en casa.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 39.sp)
-            Text("Lo que ya habéis comprado y dónde irá.", color = colors.muted, fontFamily = Manrope, fontSize = 13.sp)
+            Text("Lo que ya habéis comprado y dónde está.", color = colors.muted, fontFamily = Manrope, fontSize = 13.sp)
             Spacer(Modifier.height(18.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.weight(1f).height(48.dp).background(colors.paper, RoundedCornerShape(14.dp))
-                    .padding(horizontal = 15.dp), contentAlignment = Alignment.CenterStart) {
-                    BasicTextField(query, onValueChange = { query = it }, singleLine = true,
-                        textStyle = androidx.compose.ui.text.TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
-                        decorationBox = { inner ->
-                            if (query.isEmpty()) Text("Buscar en el inventario", color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
-                            inner()
-                        })
-                }
-                Box(Modifier.size(48.dp)
-                    .background(if (filters.activeCount > 0) colors.pine else colors.paper, RoundedCornerShape(14.dp))
-                    .clickable { filterSheetOpen = true }, contentAlignment = Alignment.Center) {
-                    Icon(painterResource(R.drawable.ic_filter), contentDescription = "Filtros",
-                        tint = if (filters.activeCount > 0) colors.paper else colors.pine, modifier = Modifier.size(19.dp))
-                }
-            }
-            if (filters.activeCount > 0) {
-                Spacer(Modifier.height(8.dp))
-                Text("${filters.activeCount} filtro(s) activo(s) · Limpiar", color = colors.pineLight, fontFamily = Manrope,
-                    fontWeight = FontWeight.Bold, fontSize = 11.sp, modifier = Modifier.clickable { filters = HomeFilters() })
-            }
-            Spacer(Modifier.height(20.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
-                Text("Inventario", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold,
-                    fontSize = 21.sp, letterSpacing = (-1).sp)
-                Text("${filtered.size} artículos", color = colors.muted, fontFamily = Manrope, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            }
-            Spacer(Modifier.height(13.dp))
+            SegmentedToggle(listOf(HomeView.LIST to "Lista", HomeView.HOUSE to "Casa"), view) { view = it }
+            Spacer(Modifier.height(4.dp))
         }
-        if (filtered.isEmpty()) {
+        if (view == HomeView.HOUSE) {
             item {
-                Surface(color = colors.paper, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                        Text(if (items.isEmpty()) "Aún no hay compras" else "No hay coincidencias",
-                            color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                        Text(if (items.isEmpty()) "Cuando registréis una compra, aparecerá aquí con toda su ficha."
-                            else "Prueba otra búsqueda o cambia los filtros.", color = colors.muted, fontFamily = Manrope, fontSize = 12.sp)
-                    }
-                }
+                HouseMap(rooms, items, pendingItems, onOpenRoom = { roomId -> roomFilter = roomId; view = HomeView.LIST },
+                    onManageRooms = onManageRooms)
             }
         } else {
-            items(filtered, key = { it.id }) { item ->
-                HomeItemCard(item, store, onEdit = { onEdit(item) }, onReceipt = { onReceipt(item) }, onPhoto = { onPhoto(item) })
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.weight(1f).height(48.dp).background(colors.paper, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 15.dp), contentAlignment = Alignment.CenterStart) {
+                        BasicTextField(query, onValueChange = { query = it }, singleLine = true,
+                            textStyle = TextStyle(color = colors.ink, fontFamily = Manrope, fontSize = 12.sp),
+                            modifier = Modifier.fillMaxWidth(),
+                            decorationBox = { inner ->
+                                if (query.isEmpty()) Text("Buscar por nombre, tienda o categoría", color = colors.muted,
+                                    fontFamily = Manrope, fontSize = 12.sp)
+                                inner()
+                            })
+                    }
+                    Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp))
+                        .background(if (chips.isNotEmpty()) colors.pine else colors.paper)
+                        .clickable { filterSheetOpen = true }, contentAlignment = Alignment.Center) {
+                        Icon(painterResource(R.drawable.ic_filter), contentDescription = "Filtros",
+                            tint = if (chips.isNotEmpty()) colors.onPine else colors.pine, modifier = Modifier.size(19.dp))
+                    }
+                }
+                if (chips.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        chips.forEach { (label, without) ->
+                            Row(Modifier.clip(CircleShape).background(colors.mint).clickable { filters = without }
+                                .padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(label, color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                Text("✕", color = colors.pine, fontFamily = Manrope, fontSize = 10.sp)
+                            }
+                        }
+                        Box(Modifier.clip(CircleShape).clickable { filters = HomeFilters() }.padding(horizontal = 8.dp, vertical = 7.dp)) {
+                            Text("Limpiar", color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                RoomFilterChips(rooms, counts, roomFilter) { roomFilter = it }
+                Spacer(Modifier.height(20.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                    Column {
+                        Text("Inventario", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold,
+                            fontSize = 21.sp, letterSpacing = (-1).sp)
+                        Text((if (filtered.size == 1) "1 artículo" else "${filtered.size} artículos") + " · " + formatMoney(filteredTotal),
+                            color = colors.muted, fontFamily = Manrope, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                    SortSelector(HomeSort.entries.map { it to it.label }, sort) { sort = it }
+                }
+                Spacer(Modifier.height(4.dp))
             }
-        }
-        item {
-            Spacer(Modifier.height(3.dp))
-            Button(onClick = onAddPurchase, colors = ButtonDefaults.buttonColors(containerColor = colors.pine),
-                modifier = Modifier.fillMaxWidth()) { Text("Registrar compra no prevista", fontFamily = Manrope, fontWeight = FontWeight.Bold) }
+            if (filtered.isEmpty()) {
+                item {
+                    Surface(color = colors.paper, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                            Text(if (items.isEmpty()) "Aún no hay compras" else "No hay coincidencias",
+                                color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                            Text(if (items.isEmpty()) "Cuando registréis una compra, aparecerá aquí con toda su ficha."
+                                else "Prueba otra búsqueda, otra habitación o quita algún filtro.", color = colors.muted,
+                                fontFamily = Manrope, fontSize = 12.sp)
+                        }
+                    }
+                }
+            } else {
+                items(filtered, key = { it.id }) { item ->
+                    HomeItemCard(item, store, onEdit = { onEdit(item) }, onReceipt = { onReceipt(item) }, onPhoto = { onPhoto(item) })
+                }
+            }
+            item {
+                Spacer(Modifier.height(3.dp))
+                Button(onClick = onAddPurchase, colors = ButtonDefaults.buttonColors(containerColor = colors.pine),
+                    modifier = Modifier.fillMaxWidth()) { Text("Registrar compra no prevista", fontFamily = Manrope, fontWeight = FontWeight.Bold) }
+            }
         }
     }
 
     if (filterSheetOpen) {
+        val previewCount = items.count { item ->
+            (roomFilter == null || item.effectiveRoomId() == roomFilter) && filters.matches(item, today)
+        }
         ModalBottomSheet(onDismissRequest = { filterSheetOpen = false }, containerColor = colors.paper) {
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 22.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                verticalArrangement = Arrangement.spacedBy(18.dp)) {
                 Text("Filtrar inventario", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 22.sp)
-                FilterChoiceRow("Categoría", categories, filters.category) { filters = filters.copy(category = it) }
-                FilterChoiceRow("Ubicación", locations, filters.location) { filters = filters.copy(location = it) }
-                FilterChoiceRow("Tienda", shops, filters.shop) { filters = filters.copy(shop = it) }
+                OptionRow("Cuándo se compró", Period.entries.map { it to it.label }, filters.period) { filters = filters.copy(period = it) }
+                if (categories.isNotEmpty()) {
+                    OptionRow("Categoría", listOf<Pair<String?, String>>(null to "Todas") + categories.map { it to it }, filters.category) {
+                        filters = filters.copy(category = it)
+                    }
+                }
+                if (shops.isNotEmpty()) {
+                    OptionRow("Tienda", listOf<Pair<String?, String>>(null to "Todas") + shops.map { it to it }, filters.shop) {
+                        filters = filters.copy(shop = it)
+                    }
+                }
+                if (payers.size > 1) {
+                    OptionRow("Quién pagó", listOf<Pair<String?, String>>(null to "Cualquiera") + payers.map { it to it }, filters.paidBy) {
+                        filters = filters.copy(paidBy = it)
+                    }
+                }
+                OptionRow("Ticket", TicketFilter.entries.map { it to it.label }, filters.ticket) { filters = filters.copy(ticket = it) }
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("PRECIO (€)".uppercase(), color = colors.pineLight, fontFamily = Manrope, fontWeight = FontWeight.Bold,
+                    Text("PRECIO (€)", color = colors.pineLight, fontFamily = Manrope, fontWeight = FontWeight.Bold,
                         fontSize = 10.sp, letterSpacing = 1.2.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedTextField(filters.minPrice, onValueChange = { filters = filters.copy(minPrice = it) },
-                            label = { Text("Mín.") }, singleLine = true, modifier = Modifier.weight(1f),
+                            label = { Text("Desde") }, singleLine = true, modifier = Modifier.weight(1f),
                             keyboardOptions = KeyboardOptions.Default.copy(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal))
                         OutlinedTextField(filters.maxPrice, onValueChange = { filters = filters.copy(maxPrice = it) },
-                            label = { Text("Máx.") }, singleLine = true, modifier = Modifier.weight(1f),
+                            label = { Text("Hasta") }, singleLine = true, modifier = Modifier.weight(1f),
                             keyboardOptions = KeyboardOptions.Default.copy(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal))
                     }
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    TextButton(onClick = { filters = HomeFilters() }, modifier = Modifier.weight(1f)) { Text("Limpiar", color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold) }
+                    TextButton(onClick = { filters = HomeFilters() }, modifier = Modifier.weight(1f)) {
+                        Text("Limpiar", color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                    }
                     Button(onClick = { filterSheetOpen = false }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine),
-                        modifier = Modifier.weight(1f)) { Text("Aplicar", fontFamily = Manrope, fontWeight = FontWeight.Bold) }
+                        modifier = Modifier.weight(1f)) {
+                        Text(if (previewCount == 1) "Ver 1 resultado" else "Ver $previewCount resultados",
+                            fontFamily = Manrope, fontWeight = FontWeight.Bold)
+                    }
                 }
                 Spacer(Modifier.height(12.dp))
-            }
-        }
-    }
-}
-
-@Composable
-private fun FilterChoiceRow(label: String, options: List<String>, selected: String?, onSelect: (String?) -> Unit) {
-    val colors = LocalPalette.current
-    if (options.isEmpty()) return
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(label.uppercase(), color = colors.pineLight, fontFamily = Manrope, fontWeight = FontWeight.Bold,
-            fontSize = 10.sp, letterSpacing = 1.2.sp)
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            options.forEach { choice ->
-                val active = selected == choice
-                Box(Modifier.background(if (active) colors.pine else colors.cream, CircleShape)
-                    .clickable { onSelect(if (active) null else choice) }
-                    .padding(horizontal = 13.dp, vertical = 9.dp)) {
-                    Text(choice, color = if (active) colors.paper else colors.muted, fontFamily = Manrope,
-                        fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                }
             }
         }
     }
@@ -1060,41 +1230,6 @@ private fun SharedScreen(store: InventoryStore, repo: HouseholdRepository, house
     }
 }
 
-/** Full-bleed, Life360-style map: its own tab so the map is the whole screen, not a strip under a header. */
-@Composable
-private fun WhereScreen(store: InventoryStore, repo: HouseholdRepository, householdId: String) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var hasLocationPermission by remember { mutableStateOf(LocationUtil.hasPermission(context)) }
-    val backgroundLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    val fineLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
-        hasLocationPermission = results.values.any { it }
-        if (hasLocationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            backgroundLocationLauncher.launch(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-        }
-    }
-    val membersFlow = remember(householdId) { repo.membersFlow(householdId) }
-    val members by membersFlow.collectAsState(initial = emptyList())
-    var locationStatus by remember { mutableStateOf("") }
-
-    LocationScreen(members, repo.memberId, hasLocationPermission, locationStatus,
-        modifier = Modifier.fillMaxSize(), store = store,
-        onRequestPermission = { fineLocationLauncher.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION)) },
-        onShareNow = {
-            locationStatus = "Buscando tu ubicación…"
-            scope.launch {
-                val location = LocationUtil.getCurrentLocation(context)
-                if (location == null) {
-                    locationStatus = "No se pudo obtener tu ubicación. Comprueba que la ubicación esté activada en el sistema e inténtalo de nuevo."
-                    return@launch
-                }
-                runCatching { repo.updateMemberLocation(householdId, location.latitude, location.longitude) }
-                    .onSuccess { locationStatus = "Ubicación compartida." }
-                    .onFailure { locationStatus = "No se pudo guardar tu ubicación. Comprueba tu conexión." }
-            }
-        })
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProfileSheet(initialName: String, initialPhoto: Uri?,
@@ -1115,251 +1250,6 @@ private fun ProfileSheet(initialName: String, initialPhoto: Uri?,
             }
             Spacer(Modifier.height(4.dp))
         }
-    }
-}
-
-// Both CARTO's raster basemaps ("API key required" watermark) and osmdroid's bundled Wikimedia
-// source (403 "restricted to Wikimedia and affiliated sites") turned out to be locked down despite
-// looking like free public CDNs. Standard OpenStreetMap tiles are the one basemap with a usage policy
-// explicitly written for exactly this: a small app with a real User-Agent and light traffic (see
-// operations.osmfoundation.org/policies/tiles) — and it's osmdroid's own documented default source.
-// Dark mode reuses it with a color-invert filter instead of gambling on yet another "free" dark CDN.
-private val MapTileSource = org.osmdroid.tileprovider.tilesource.TileSourceFactory.MAPNIK
-private val DarkMapColorFilter = android.graphics.ColorMatrixColorFilter(
-    android.graphics.ColorMatrix(floatArrayOf(
-        -1f, 0f, 0f, 0f, 255f,
-        0f, -1f, 0f, 0f, 255f,
-        0f, 0f, -1f, 0f, 255f,
-        0f, 0f, 0f, 1f, 0f,
-    )),
-)
-
-/** Draws a Life360-style avatar pin: a circular photo (or initial) bubble in the member's color, with a pointer tail. */
-private fun buildAvatarMarkerIcon(context: Context, photoUri: Uri?, name: String, ringColor: Int): BitmapDrawable {
-    val density = context.resources.displayMetrics.density
-    val circleDiameter = 50f * density
-    val ringWidth = 3f * density
-    val tailHeight = 9f * density
-    val pad = 6f * density
-    val size = circleDiameter + pad * 2
-    val width = size.toInt()
-    val height = (size + tailHeight).toInt()
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val canvas = Canvas(bitmap)
-    val cx = width / 2f
-    val cy = size / 2f
-    val radius = circleDiameter / 2f
-    val innerRadius = radius - ringWidth
-
-    canvas.drawCircle(cx, cy + 2f * density, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = android.graphics.Color.argb(0x40, 0, 0, 0)
-        maskFilter = BlurMaskFilter(4f * density, BlurMaskFilter.Blur.NORMAL)
-    })
-    canvas.drawCircle(cx, cy, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.WHITE })
-
-    val photoBitmap = photoUri?.let { uri ->
-        runCatching {
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                BitmapFactory.decodeStream(input, null, BitmapFactory.Options().apply { inSampleSize = 4 })
-            }
-        }.getOrNull()
-    }
-    if (photoBitmap != null) {
-        val scale = (innerRadius * 2) / minOf(photoBitmap.width, photoBitmap.height).toFloat()
-        val matrix = Matrix().apply {
-            setScale(scale, scale)
-            postTranslate(
-                cx - innerRadius - (photoBitmap.width * scale - innerRadius * 2) / 2f,
-                cy - innerRadius - (photoBitmap.height * scale - innerRadius * 2) / 2f,
-            )
-        }
-        val shader = BitmapShader(photoBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).apply { setLocalMatrix(matrix) }
-        canvas.drawCircle(cx, cy, innerRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply { this.shader = shader })
-    } else {
-        canvas.drawCircle(cx, cy, innerRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ringColor })
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.WHITE
-            textAlign = Paint.Align.CENTER
-            textSize = innerRadius
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        canvas.drawText(name.take(1).uppercase(), cx, cy - (textPaint.descent() + textPaint.ascent()) / 2f, textPaint)
-    }
-
-    canvas.drawCircle(cx, cy, radius - ringWidth / 2f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ringColor; style = Paint.Style.STROKE; strokeWidth = ringWidth
-    })
-    canvas.drawPath(Path().apply {
-        moveTo(cx - 7f * density, size - 1f)
-        lineTo(cx + 7f * density, size - 1f)
-        lineTo(cx, height.toFloat())
-        close()
-    }, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ringColor })
-
-    return BitmapDrawable(context.resources, bitmap)
-}
-
-@Composable
-private fun LocationScreen(members: List<Member>, ownMemberId: String, hasLocationPermission: Boolean, statusMessage: String,
-    modifier: Modifier = Modifier, store: InventoryStore, onRequestPermission: () -> Unit, onShareNow: () -> Unit) {
-    val colors = LocalPalette.current
-    val context = LocalContext.current
-    val isDark = colors === DarkPalette
-    val located = members.filter { it.lat != null && it.lng != null }
-    val ringPalette = remember(colors) { listOf(colors.pine, colors.danger, colors.peach, colors.pineLight, colors.sand) }
-
-    Box(modifier.fillMaxSize().background(colors.cream)) {
-        if (located.isEmpty()) {
-            // Nothing to show a map of yet: same content, but as a plain (non-floating) column.
-            Column(Modifier.fillMaxSize().padding(22.dp)) {
-                PageLabel("Dónde estamos")
-                Spacer(Modifier.height(10.dp))
-                Text("Toda la familia.", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 32.sp)
-                Spacer(Modifier.height(16.dp))
-                LocationPermissionOrShareCard(hasLocationPermission, statusMessage, onRequestPermission, onShareNow)
-                Spacer(Modifier.height(16.dp))
-                EmptySharedState("Sin ubicaciones todavía", "En cuanto alguien comparta su ubicación, aparecerá aquí en el mapa.")
-            }
-        } else {
-            val target = located.firstOrNull { it.id == ownMemberId } ?: located.first()
-            val mapViewRef = remember { mutableStateOf<org.osmdroid.views.MapView?>(null) }
-            val markerIcons = remember { mutableMapOf<String, BitmapDrawable>() }
-
-            // Full-bleed map: everything else (top bar, share pill, people sheet) floats on top of it,
-            // Life360-style, instead of pushing it down into a strip under a header.
-            androidx.compose.ui.viewinterop.AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    org.osmdroid.views.MapView(ctx).apply {
-                        setMultiTouchControls(true)
-                        setTileSource(MapTileSource)
-                        if (isDark) overlayManager.tilesOverlay.setColorFilter(DarkMapColorFilter)
-                        isTilesScaledToDpi = true
-                        minZoomLevel = 3.0
-                        maxZoomLevel = 19.0
-                        overlays.add(org.osmdroid.views.overlay.CopyrightOverlay(ctx))
-                        controller.setZoom(15.0)
-                        // Center once, here at creation, and never again: doing this in `update` would
-                        // snap the camera back and undo the user's own pan/zoom every time a location syncs.
-                        controller.setCenter(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
-                        mapViewRef.value = this
-                    }
-                },
-                update = { mapView ->
-                    mapView.overlays.removeAll { it is org.osmdroid.views.overlay.Marker }
-                    located.forEach { member ->
-                        val photoUri = store.memberPhotoUri(member)
-                        val markerIcon = markerIcons.getOrPut("${member.id}|$photoUri|$isDark") {
-                            buildAvatarMarkerIcon(context, photoUri, member.name, ringPalette[(member.id.hashCode() and Int.MAX_VALUE) % ringPalette.size].toArgb())
-                        }
-                        mapView.overlays.add(org.osmdroid.views.overlay.Marker(mapView).apply {
-                            position = org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!)
-                            title = member.name
-                            icon = markerIcon
-                            setAnchor(0.5f, 1f)
-                        })
-                    }
-                    mapView.invalidate()
-                },
-                onRelease = { mapView -> mapView.onDetach() },
-            )
-
-            Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(16.dp)) {
-                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.paper.copy(alpha = 0.95f))
-                    .padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Image(painter = painterResource(R.drawable.cym_icon), contentDescription = null,
-                        modifier = Modifier.size(22.dp).clip(RoundedCornerShape(7.dp)))
-                    Spacer(Modifier.width(10.dp))
-                    Text("Dónde estamos", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 14.sp,
-                        modifier = Modifier.weight(1f))
-                }
-                Spacer(Modifier.height(10.dp))
-                LocationPermissionOrShareCard(hasLocationPermission, statusMessage, onRequestPermission, onShareNow, floating = true)
-            }
-
-            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
-                Box(Modifier.fillMaxWidth().padding(end = 16.dp, bottom = 12.dp), contentAlignment = Alignment.CenterEnd) {
-                    Box(Modifier.size(46.dp).clip(CircleShape).background(colors.paper).clickable {
-                        mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(target.lat!!, target.lng!!))
-                        mapViewRef.value?.controller?.setZoom(15.0)
-                    }, contentAlignment = Alignment.Center) {
-                        Icon(painterResource(R.drawable.ic_map_pin), contentDescription = "Centrar en mí", tint = colors.pine, modifier = Modifier.size(20.dp))
-                    }
-                }
-                Column(Modifier.fillMaxWidth().background(colors.paper, RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp))
-                    .padding(top = 10.dp, start = 18.dp, end = 18.dp, bottom = 18.dp)) {
-                    Box(Modifier.align(Alignment.CenterHorizontally).width(36.dp).height(4.dp)
-                        .clip(RoundedCornerShape(2.dp)).background(colors.line))
-                    Spacer(Modifier.height(14.dp))
-                    Text("GENTE", color = colors.muted, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 10.sp, letterSpacing = 1.sp)
-                    Spacer(Modifier.height(8.dp))
-                    Column(Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState())) {
-                        members.forEach { member ->
-                            val isStale = member.lat == null || member.lng == null
-                            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                                .clickable(enabled = !isStale) {
-                                    mapViewRef.value?.controller?.animateTo(org.osmdroid.util.GeoPoint(member.lat!!, member.lng!!))
-                                }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Box(Modifier.size(36.dp).clip(CircleShape).background(colors.mint)) {
-                                    PhotoAvatar(member.name, store.memberPhotoUri(member), Modifier.fillMaxSize(), colors.pineLight, 14.sp)
-                                }
-                                Column(Modifier.weight(1f)) {
-                                    Text(member.name, color = colors.ink, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                    Text(
-                                        if (member.locationUpdatedAt != null) "Actualizado ${timeAgo(member.locationUpdatedAt)}" else "Sin compartir aún",
-                                        color = colors.muted, fontFamily = Manrope, fontSize = 11.sp,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun LocationPermissionOrShareCard(hasLocationPermission: Boolean, statusMessage: String,
-    onRequestPermission: () -> Unit, onShareNow: () -> Unit, floating: Boolean = false) {
-    val colors = LocalPalette.current
-    val bg = if (floating) colors.paper.copy(alpha = 0.95f) else colors.paper
-    if (!hasLocationPermission) {
-        Surface(color = bg, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Activa la ubicación", color = colors.ink, fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Text("Para ver dónde está cada uno hace falta el permiso de ubicación. Se comparte de forma aproximada cada 15 minutos, incluso con la app cerrada.",
-                    color = colors.muted, fontFamily = Manrope, fontSize = 12.sp, lineHeight = 17.sp)
-                Button(onClick = onRequestPermission, colors = ButtonDefaults.buttonColors(containerColor = colors.pine)) {
-                    Text("Activar ubicación", fontFamily = Manrope, fontWeight = FontWeight.Bold)
-                }
-            }
-        }
-    } else {
-        Column {
-            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(bg)
-                .clickable(onClick = onShareNow).padding(14.dp), horizontalArrangement = Arrangement.Center) {
-                Text("Compartir mi ubicación ahora", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-            }
-            if (statusMessage.isNotBlank()) {
-                Spacer(Modifier.height(8.dp))
-                Surface(color = bg, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
-                    Text(statusMessage, color = colors.muted, fontFamily = Manrope, fontSize = 11.sp, lineHeight = 15.sp,
-                        modifier = Modifier.padding(12.dp))
-                }
-            }
-        }
-    }
-}
-
-private fun timeAgo(timestamp: Long): String {
-    val minutes = (System.currentTimeMillis() - timestamp) / 60_000
-    return when {
-        minutes < 1 -> "hace un momento"
-        minutes < 60 -> "hace $minutes min"
-        minutes < 24 * 60 -> "hace ${minutes / 60} h"
-        else -> "hace ${minutes / (24 * 60)} d"
     }
 }
 
@@ -1578,11 +1468,12 @@ private fun BottomBar(selected: Tab, onTab: (Tab) -> Unit) {
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryStore,
-    onDismiss: () -> Unit, onSave: (InventoryItem, Uri?, Uri?) -> Unit, onDelete: (InventoryItem) -> Unit) {
+private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryStore, rooms: List<Room>, categories: List<String>,
+    initialRoomId: String, onDismiss: () -> Unit, onSave: (InventoryItem, Uri?, Uri?) -> Unit, onDelete: (InventoryItem) -> Unit,
+    onCreateRoom: (Room) -> Unit) {
     val colors = LocalPalette.current
     var name by remember(item?.id, purchase) { mutableStateOf(item?.name ?: "") }
-    var room by remember(item?.id, purchase) { mutableStateOf(item?.room ?: "") }
+    var roomId by remember(item?.id, purchase) { mutableStateOf(item?.effectiveRoomId() ?: initialRoomId) }
     var category by remember(item?.id, purchase) { mutableStateOf(item?.category ?: "") }
     var price by remember(item?.id, purchase) { mutableStateOf(item?.priceCents?.let { BigDecimal(it).movePointLeft(2).toPlainString() } ?: "") }
     var shop by remember(item?.id, purchase) { mutableStateOf(item?.shop ?: "") }
@@ -1594,43 +1485,83 @@ private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryS
     var photo by remember(item?.id, purchase) { mutableStateOf<Uri?>(null) }
     var error by remember(item?.id, purchase) { mutableStateOf("") }
     var saving by remember(item?.id, purchase) { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    // Habitaciones creadas desde aquí: aún pueden no haber llegado de Firestore cuando se pulsa Guardar.
+    var createdRooms by remember { mutableStateOf(listOf<Room>()) }
+    val allRooms = rooms + createdRooms.filter { created -> rooms.none { it.id == created.id } }
+    // Se guarda con rememberSaveable: si Android cierra la app mientras la cámara está abierta, no se pierde el destino.
+    var cameraTarget by rememberSaveable { mutableStateOf<Uri?>(null) }
     val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { receipt = it }
-    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { photo = it }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { if (it != null) receipt = it }
+    val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { if (it != null) photo = it }
+    val receiptCamera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok -> if (ok) receipt = cameraTarget }
+    val photoCamera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok -> if (ok) photo = cameraTarget }
     val existingPhoto = remember(item?.id, purchase) { item?.let { store.photoUri(it) } }
+    val categorySuggestions = remember(category, categories) {
+        val key = normalizeKey(category)
+        categories.filter { normalizeKey(it) != key && (key.isEmpty() || normalizeKey(it).contains(key)) }.take(10)
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.paper) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 22.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(if (purchase) "Registrar compra" else "Añadir pendiente", color = colors.ink,
+            Text(if (purchase) "Registrar compra" else if (item == null) "Añadir pendiente" else "Editar pendiente", color = colors.ink,
                 fontFamily = Syne, fontWeight = FontWeight.Bold, fontSize = 26.sp)
             Text(if (purchase) "Artículo, precio, fecha y ticket. Los detalles pueden esperar."
                 else "Añadidlo ahora y completad la ficha después.", color = colors.muted,
                 fontFamily = Manrope, fontSize = 12.sp)
             OutlinedTextField(name, onValueChange = { name = it }, label = { Text("Artículo") },
-                singleLine = true, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(room, onValueChange = { room = it }, label = { Text("Habitación (opcional)") },
-                singleLine = true, modifier = Modifier.fillMaxWidth())
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences))
+            RoomSelector(allRooms, roomId, onSelect = { roomId = it }, onCreateRoom = { room ->
+                createdRooms = createdRooms + room
+                roomId = room.id
+                onCreateRoom(room)
+            })
             OutlinedTextField(category, onValueChange = { category = it }, label = { Text("Categoría (opcional)") },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences))
+            if (categorySuggestions.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    categorySuggestions.forEach { suggestion ->
+                        FilterPill(suggestion, null, null, false, idleColor = colors.cream) { category = suggestion }
+                    }
+                }
+            }
+            PhotoPicker(photo ?: existingPhoto, onPick = { photoPicker.launch("image/*") }, onCamera = {
+                val uri = store.newCameraUri()
+                cameraTarget = uri
+                photoCamera.launch(uri)
+            })
+            OutlinedTextField(price, onValueChange = { price = it },
+                label = { Text(if (purchase) "Precio (€)" else "Precio estimado (€, opcional)") },
+                keyboardOptions = KeyboardOptions.Default.copy(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
                 singleLine = true, modifier = Modifier.fillMaxWidth())
-            PhotoPicker(photo ?: existingPhoto, onPick = { photoPicker.launch("image/*") })
             if (purchase) {
-                OutlinedTextField(price, onValueChange = { price = it }, label = { Text("Precio (€)") },
-                    keyboardOptions = KeyboardOptions.Default.copy(keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal),
-                    singleLine = true, modifier = Modifier.fillMaxWidth())
                 val current = runCatching { LocalDate.parse(date) }.getOrDefault(LocalDate.now())
                 TextButton(onClick = {
                     DatePickerDialog(context, { _, year, month, day ->
                         date = "%04d-%02d-%02d".format(year, month + 1, day)
                     }, current.year, current.monthValue - 1, current.dayOfMonth).show()
                 }) { Text("Fecha: $date", color = colors.pine, fontFamily = Manrope) }
-                TextButton(onClick = { picker.launch(arrayOf("image/*", "application/pdf")) }) {
-                    Text(if (receipt != null) "Ticket seleccionado ✓" else if (item?.receiptMime != null) "Cambiar ticket (foto o PDF)" else "Adjuntar ticket (foto o PDF)",
-                        color = colors.pine, fontFamily = Manrope)
+                Text("TICKET", color = colors.pineLight, fontFamily = Manrope, fontWeight = FontWeight.Bold,
+                    fontSize = 10.sp, letterSpacing = 1.2.sp)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SoftButton("📷  Hacer foto", Modifier.weight(1f)) {
+                        val uri = store.newCameraUri()
+                        cameraTarget = uri
+                        receiptCamera.launch(uri)
+                    }
+                    SoftButton("📎  Adjuntar archivo", Modifier.weight(1f)) { picker.launch(arrayOf("image/*", "application/pdf")) }
                 }
+                Text(when {
+                    receipt != null -> "Ticket nuevo listo para guardar ✓"
+                    item?.receiptMime != null -> "Ya tiene ticket. Elige otro si quieres cambiarlo."
+                    else -> "Foto o PDF de hasta ${InventoryStore.RECEIPT_PDF_MAX_BYTES / 1_000_000} MB."
+                }, color = if (receipt != null) colors.pine else colors.muted, fontFamily = Manrope, fontSize = 11.sp)
                 OutlinedTextField(shop, onValueChange = { shop = it }, label = { Text("Tienda (opcional)") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(location, onValueChange = { location = it }, label = { Text("Dónde irá (opcional)") },
+                OutlinedTextField(location, onValueChange = { location = it }, label = { Text("Dónde está exactamente (opcional)") },
                     singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(purpose, onValueChange = { purpose = it }, label = { Text("Para qué sirve (opcional)") },
                     modifier = Modifier.fillMaxWidth())
@@ -1640,27 +1571,39 @@ private fun ItemSheet(item: InventoryItem?, purchase: Boolean, store: InventoryS
             if (error.isNotBlank()) Text(error, color = colors.danger, fontFamily = Manrope, fontSize = 11.sp)
             Button(enabled = !saving, onClick = {
                 if (name.isBlank()) { error = "Escribe el nombre del artículo"; return@Button }
-                val cents = if (purchase) parseMoney(price) else null
+                val cents = parseMoney(price)
                 if (purchase && cents == null) { error = "Indica un precio válido"; return@Button }
+                if (!purchase && price.isNotBlank() && cents == null) { error = "El precio estimado no es válido"; return@Button }
+                // Si la categoría ya existe con otra escritura ("cocina" / "Cocina"), se usa la que ya había.
+                val cleanCategory = categories.firstOrNull { normalizeKey(it) == normalizeKey(category) } ?: category.trim()
+                val room = allRooms.firstOrNull { it.id == roomId }
                 saving = true
                 val value = (item ?: InventoryItem(name = name.trim())).copy(
-                    name = name.trim(), room = room.trim(), category = category.trim(),
+                    name = name.trim(), roomId = room?.id ?: "", room = room?.name ?: "", category = cleanCategory,
                     status = if (purchase) ItemStatus.PURCHASED else ItemStatus.PLANNED,
                     priceCents = cents, purchaseDate = if (purchase) date else null,
                     shop = shop.trim(), description = description.trim(), location = location.trim(), purpose = purpose.trim(),
                 )
                 onSave(value, photo, receipt)
             }, colors = ButtonDefaults.buttonColors(containerColor = colors.pine), modifier = Modifier.fillMaxWidth()) {
-                Text(if (purchase) "Guardar compra" else "Añadir a pendientes", fontFamily = Manrope,
-                    fontWeight = FontWeight.Bold)
+                Text(if (purchase) "Guardar compra" else if (item == null) "Añadir a pendientes" else "Guardar cambios",
+                    fontFamily = Manrope, fontWeight = FontWeight.Bold)
             }
             if (item != null) {
-                TextButton(onClick = { onDelete(item) }, modifier = Modifier.fillMaxWidth()) {
+                TextButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth()) {
                     Text("Eliminar artículo", color = colors.danger, fontFamily = Manrope, fontWeight = FontWeight.Bold)
                 }
             }
             Spacer(Modifier.height(12.dp))
         }
+    }
+    if (confirmDelete && item != null) {
+        ConfirmDeleteDialog(
+            title = "¿Eliminar «${item.name}»?",
+            message = "Se borrará también del móvil de la otra persona, junto con su foto y su ticket.",
+            onConfirm = { confirmDelete = false; onDelete(item) },
+            onDismiss = { confirmDelete = false },
+        )
     }
 }
 
@@ -1735,7 +1678,7 @@ private fun ProfilePhotoPicker(name: String, source: Uri?, onPick: () -> Unit) {
 }
 
 @Composable
-private fun PhotoPicker(source: Uri?, onPick: () -> Unit) {
+private fun PhotoPicker(source: Uri?, onPick: () -> Unit, onCamera: (() -> Unit)? = null) {
     val colors = LocalPalette.current
     val bitmap = rememberThumbnail(source)
     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.cream)
@@ -1749,7 +1692,13 @@ private fun PhotoPicker(source: Uri?, onPick: () -> Unit) {
             }
         }
         Text(if (bitmap != null) "Cambiar foto del artículo" else "Añadir foto del artículo (opcional)",
-            color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.weight(1f))
+        if (onCamera != null) {
+            Box(Modifier.size(42.dp).clip(RoundedCornerShape(11.dp)).background(colors.paper).clickable(onClick = onCamera),
+                contentAlignment = Alignment.Center) {
+                Text("📷", fontSize = 18.sp)
+            }
+        }
     }
 }
 
@@ -1816,7 +1765,12 @@ private fun WishlistItemCard(item: WishlistItem, store: InventoryStore, onEdit: 
     val colors = LocalPalette.current
     val context = LocalContext.current
     var expanded by remember(item.id) { mutableStateOf(false) }
+    var confirmDelete by remember(item.id) { mutableStateOf(false) }
     val rotation by androidx.compose.animation.core.animateFloatAsState(if (expanded) 180f else 0f, label = "chevron")
+    if (confirmDelete) {
+        ConfirmDeleteDialog(title = "¿Quitar «${item.name}» de deseados?", message = "Se quitará también del móvil de la otra persona.",
+            onConfirm = { confirmDelete = false; onDelete() }, onDismiss = { confirmDelete = false })
+    }
 
     Surface(color = colors.paper, shape = RoundedCornerShape(19.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.animateContentSize().clickable { expanded = !expanded }.padding(15.dp)) {
@@ -1888,7 +1842,7 @@ private fun WishlistItemCard(item: WishlistItem, store: InventoryStore, onEdit: 
                         Text("A pendientes", color = colors.pine, fontFamily = Manrope, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     }
                     Box(Modifier.clip(RoundedCornerShape(12.dp)).background(colors.cream)
-                        .clickable(onClick = onDelete).padding(horizontal = 14.dp, vertical = 12.dp)) {
+                        .clickable { confirmDelete = true }.padding(horizontal = 14.dp, vertical = 12.dp)) {
                         Icon(painterResource(R.drawable.ic_trash), contentDescription = "Eliminar", tint = colors.danger, modifier = Modifier.size(15.dp))
                     }
                 }
@@ -1961,21 +1915,23 @@ private fun parseMoney(raw: String): Long? = runCatching {
     amount.multiply(BigDecimal(100)).setScale(0, RoundingMode.HALF_UP).longValueExact()
 }.getOrNull()
 
-private fun formatMoney(cents: Long): String = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("es-ES"))
+internal fun formatMoney(cents: Long): String = NumberFormat.getCurrencyInstance(Locale.forLanguageTag("es-ES"))
     .format(BigDecimal(cents).movePointLeft(2))
+
+private val PreviewRooms = listOf(Room("salon", "Salón", "🛋️", 0), Room("dormitorio", "Dormitorio", "🛏️", 1), Room("cocina", "Cocina", "🍳", 2))
 
 @Preview(showBackground = true, widthDp = 420, heightDp = 900)
 @Composable
 private fun PlannedPreview() {
     val store = InventoryStore(LocalContext.current)
     PlannedScreen(listOf(
-        InventoryItem(name = "Sofá", room = "Salón", category = "Muebles"),
-        InventoryItem(name = "Lámpara de techo", room = "Salón", category = "Iluminación"),
-        InventoryItem(name = "Juego de sábanas", room = "Dormitorio", category = "Textil"),
-    ), store, recentHome = listOf(
-        InventoryItem(name = "Mesa de centro", room = "Salón", category = "Muebles",
+        InventoryItem(name = "Sofá", roomId = "salon", room = "Salón", category = "Muebles", priceCents = 59900),
+        InventoryItem(name = "Lámpara de techo", roomId = "salon", room = "Salón", category = "Iluminación"),
+        InventoryItem(name = "Juego de sábanas", roomId = "dormitorio", room = "Dormitorio", category = "Textil", priceCents = 3500),
+    ), store, PreviewRooms, recentHome = listOf(
+        InventoryItem(name = "Mesa de centro", roomId = "salon", room = "Salón", category = "Muebles",
             status = ItemStatus.PURCHASED, priceCents = 8900, purchaseDate = "2026-09-10"),
-    ), onAdd = {}, onBuy = {}, onEdit = {}, onOpenHome = {}, onSeeAllHome = {})
+    ), onAdd = {}, onQuickAdd = { _, _ -> }, onBuy = {}, onEdit = {}, onOpenHome = {}, onSeeAllHome = {})
 }
 
 @Preview(showBackground = true, widthDp = 420, heightDp = 900)
@@ -1983,12 +1939,12 @@ private fun PlannedPreview() {
 private fun HomePreview() {
     val store = InventoryStore(LocalContext.current)
     HomeScreen(listOf(
-        InventoryItem(name = "Mesa de centro", room = "Salón", category = "Muebles", status = ItemStatus.PURCHASED,
-            priceCents = 8900, purchaseDate = "2026-09-10", shop = "IKEA", location = "Salón, junto al sofá",
+        InventoryItem(name = "Mesa de centro", roomId = "salon", room = "Salón", category = "Muebles", status = ItemStatus.PURCHASED,
+            priceCents = 8900, purchaseDate = "2026-09-10", shop = "IKEA", location = "Junto al sofá",
             purpose = "Apoyar cosas y decorar", description = "Mesa redonda de madera clara.", receiptMime = "image/jpeg"),
-        InventoryItem(name = "Lámpara de pie", room = "Dormitorio", category = "Iluminación", status = ItemStatus.PURCHASED,
-            priceCents = 3200, purchaseDate = "2026-09-05", shop = "Leroy Merlin"),
-    ), store, onAddPurchase = {}, onEdit = {}, onReceipt = {}, onPhoto = {}, onExport = {})
+        InventoryItem(name = "Lámpara de pie", roomId = "dormitorio", room = "Dormitorio", category = "Iluminación",
+            status = ItemStatus.PURCHASED, priceCents = 3200, purchaseDate = "2026-09-05", shop = "Leroy Merlin"),
+    ), emptyList(), PreviewRooms, store, onAddPurchase = {}, onEdit = {}, onReceipt = {}, onPhoto = {}, onExport = {}, onManageRooms = {})
 }
 
 @Preview(showBackground = true, widthDp = 420, heightDp = 900)
