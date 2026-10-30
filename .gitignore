@@ -10,3 +10,7 @@ captures/
 
 .android-home/
 firebase-debug.log
+# Builds firmados que genera Android Studio
+app/release/
+*.jks
+*.keystore
